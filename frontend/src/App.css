@@ -1,0 +1,24 @@
+/* Custom App Styling for Solar-Safe High Contrast Field Operations */
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800;900&family=Inter:wght@400;500;600;700;800;900&display=swap');
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #F7F6F2;
+  color: #1A1A1A;
+  -webkit-tap-highlight-color: transparent;
+}
+
+h1, h2, h3, .font-heading {
+  font-family: 'Barlow Condensed', sans-serif;
+}
+
+/* Touch targets & High contrast buttons */
+button {
+  user-select: none;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}

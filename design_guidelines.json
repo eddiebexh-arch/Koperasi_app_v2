@@ -1,0 +1,31 @@
+{
+  "app_context": "Palm Oil Weighing & Trading PWA & Dashboard (BUB Makekal Hulu)",
+  "archetype": "ORGANIC & EARTHY + PERFORMANCE PRO (High contrast solar-safe field UI & professional management dashboard)",
+  "typography": {
+    "headings": "Barlow Condensed, sans-serif",
+    "body": "Inter, sans-serif"
+  },
+  "colors": {
+    "primary": "#1E4620",
+    "primary_hover": "#2C662F",
+    "accent_gold": "#D4A373",
+    "background_light": "#F7F6F2",
+    "surface_card": "#FFFFFF",
+    "alert_yellow": "#FEFAE0",
+    "alert_yellow_border": "#D4A373",
+    "alert_red": "#F8D7DA",
+    "alert_red_text": "#721C24"
+  },
+  "component_path": "/app/frontend/src/components",
+  "instructions_to_main_agent": "Ensure full offline-first PWA capability with IndexedDB fallback, WAC pool stock calculation, Trip Jual Loading (Grade A/B split, Retur Grade B, 2% deduction, Net Margin), Isolated Operational Expenses, Admin Initialization Form, and Remote Auditor Dashboard with >5% shrinkage alert highlights.",
+  "image_urls": {
+    "plantation_hero": "https://images.unsplash.com/photo-1781453640944-60a08e7adf63?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzOTB8MHwxfHNlYXJjaHwxfHxwYWxtJTIwb2lsJTIwcGxhbnRhdGlvbiUyMGhhcnZlc3RlciUyMGhlYXZ5JTIwdHJ1Y2t8ZW58MHx8fHwxNzg4MjMzMDA3fDA&ixlib=rb-4.1.0&q=85",
+    "tractor_road": "https://images.unsplash.com/photo-1781453642124-9d6b3f4b18ac?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzOTB8MHwxfHNlYXJjaHwyfHxwYWxtJTIwb2lsJTIwcGxhbnRhdGlvbiUyMGhhcnZlc3RlciUyMGhlYXZ5JTIwdHJ1Y2t8ZW58MHx8fHwxNzg4MjMzMDA3fDA&ixlib=rb-4.1.0&q=85"
+  },
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "Use data-testid attributes on all interactive elements for robust testing.",
+    "Implement high contrast, large touch targets for outdoor sunlight visibility in field operations.",
+    "Provide seamless switching between Operator Tablet Mode and Manager/Auditor Dashboard Mode.",
+    "Ensure digital receipt summary view without physical printer dependency."
+  ]
+}
