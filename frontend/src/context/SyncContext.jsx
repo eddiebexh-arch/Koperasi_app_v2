@@ -76,14 +76,19 @@ export function SyncProvider({ children }) {
       let returnedBkg = 0;
 
       allTrips.forEach(t => {
-        const dispW = parseFloat(t.dispatched_weight_kg || 0);
         const retB = parseFloat(t.grade_b_returned_kg || 0);
         returnedBkg += retB;
 
-        if (t.commodity_type === 'BERONDOL') {
-          berondolDispatchedKg += dispW;
+        // Prefer dual breakdown when available
+        const tbsD = parseFloat(t.tbs_dispatched_kg || 0);
+        const brdD = parseFloat(t.berondol_dispatched_kg || 0);
+        if (tbsD > 0 || brdD > 0) {
+          tbsDispatchedKg += tbsD;
+          berondolDispatchedKg += brdD;
         } else {
-          tbsDispatchedKg += dispW;
+          const dispW = parseFloat(t.dispatched_weight_kg || 0);
+          if (t.commodity_type === 'BERONDOL') berondolDispatchedKg += dispW;
+          else tbsDispatchedKg += dispW;
         }
       });
 
@@ -130,6 +135,25 @@ export function SyncProvider({ children }) {
       const unsyncedPurchases = await db.purchases.where('synced').equals(0).toArray();
       const unsyncedTrips = await db.trips.where('synced').equals(0).toArray();
       const unsyncedExpenses = await db.expenses.where('synced').equals(0).toArray();
+      // Deletion tombstones to propagate to server
+      let unsyncedDeletes = [];
+      try {
+        unsyncedDeletes = await db.deleted_queue.where('synced').equals(0).toArray();
+      } catch (_) {}
+
+      // Process deletions first (server accepts DELETE with local_id)
+      for (const d of unsyncedDeletes) {
+        try {
+          const path =
+            d.entity_type === 'PURCHASE' ? 'purchases'
+            : d.entity_type === 'TRIP' ? 'trips'
+            : 'expenses';
+          await axios.delete(`${API}/${path}/${encodeURIComponent(d.local_id)}`);
+          await db.deleted_queue.update(d.id, { synced: 1 });
+        } catch (err) {
+          console.warn('Delete sync failed for', d, err?.response?.status);
+        }
+      }
 
       if (unsyncedPurchases.length === 0 && unsyncedTrips.length === 0 && unsyncedExpenses.length === 0) {
         await refreshStockPool();

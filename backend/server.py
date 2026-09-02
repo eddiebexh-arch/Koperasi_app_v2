@@ -11,8 +11,7 @@ load_dotenv()
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, ConfigDict, BeforeValidator
-from typing_extensions import Annotated
+from pydantic import BaseModel, Field
 import bcrypt
 import jwt
 
@@ -106,8 +105,8 @@ class FarmerCreate(BaseModel):
 class AppSettingsModel(BaseModel):
     default_transport_rate_per_ton: float = 70000.0  # Rp per ton (1000kg)
     transport_preset_options: List[float] = [70000.0, 100000.0]
-    default_unloading_rate_tbs: float = 25.0  # Rp per kg
-    default_unloading_rate_berondol: float = 30.0  # Rp per kg
+    default_unloading_rate_tbs: float = 40000.0  # Rp per ton TBS (Rp 40/kg)
+    default_unloading_rate_berondol: float = 60000.0  # Rp per ton Berondol (Rp 60/kg)
     shrinkage_alert_pct: float = 5.0  # Susut > 5% ditandai merah
     last_price_tbs: float = 2450.0  # Rp per kg
     last_price_berondol: float = 2700.0  # Rp per kg
@@ -135,21 +134,39 @@ class SalesTripCreate(BaseModel):
     trip_date: Optional[str] = None
     loading_name: str = "Loading RAM Makekal"
     nota_number: Optional[str] = ""
-    commodity_type: str = "TBS"  # 'TBS' | 'BERONDOL' | 'MIXED'
-    dispatched_weight_kg: float  # Berat saat berangkat dari lapangan (alokasi pool)
-    loading_weight_kg: float  # Berat hasil timbang loading
+    commodity_type: str = "TBS"  # 'TBS' | 'BERONDOL' | 'DUAL' / 'MIXED'
+    
+    # Dual Commodity Dispatched Weights
+    dispatched_weight_kg: float = 0.0  # Total
+    tbs_dispatched_kg: float = 0.0
+    berondol_dispatched_kg: float = 0.0
+    
+    # Dual Commodity Loading Weights
+    loading_weight_kg: float = 0.0  # Total
+    tbs_loading_kg: float = 0.0
+    berondol_loading_kg: float = 0.0
+
+    # TBS Grading
     grade_a: Optional[GradeSplit] = None
     grade_b_sold: Optional[GradeSplit] = None
     grade_b_returned_kg: float = 0.0  # Retur bawa pulang untuk berondol
+    
+    # Berondol Direct Sale in same trip
+    berondol_sold: Optional[GradeSplit] = None
+
+    # Logistics (per ton defaults)
     transport_rate_per_ton: float = 70000.0
     transport_cost: Optional[float] = None
-    unloading_rate_tbs: float = 25.0
-    unloading_rate_berondol: float = 30.0
+    unloading_rate_tbs_per_ton: float = 40000.0
+    unloading_rate_berondol_per_ton: float = 60000.0
     unloading_cost: Optional[float] = None
     tips: float = 0.0
+    
     payment_status: str = "COD"  # 'COD' or 'PENDING'
     due_date: Optional[str] = None
     cogs_allocated: Optional[float] = None
+    total_revenue: Optional[float] = None
+    net_margin: Optional[float] = None
     notes: Optional[str] = ""
 
 class OperationalExpenseCreate(BaseModel):
@@ -172,14 +189,20 @@ api_router = APIRouter(prefix="/api")
 # Startup event: Seed initial data
 @app.on_event("startup")
 async def startup_event():
-    # 1. Check or Seed Settings
+    # 1. Settings
     settings = await db.app_settings.find_one({"setting_id": "default"})
+    default_data = AppSettingsModel().model_dump()
+    default_data["setting_id"] = "default"
+    default_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     if not settings:
-        default_settings = AppSettingsModel().model_dump()
-        default_settings["setting_id"] = "default"
-        default_settings["updated_at"] = datetime.now(timezone.utc).isoformat()
-        await db.app_settings.insert_one(default_settings)
-        logger.info("Initialized default app settings.")
+        await db.app_settings.insert_one(default_data)
+    else:
+        # Update default unloading rates if old values existed
+        if settings.get("default_unloading_rate_tbs", 0) <= 50:
+            await db.app_settings.update_one(
+                {"setting_id": "default"},
+                {"$set": {"default_unloading_rate_tbs": 40000.0, "default_unloading_rate_berondol": 60000.0}}
+            )
 
     # 2. Seed Default Admin Account
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@makekal.id")
@@ -194,7 +217,6 @@ async def startup_event():
             "role": "admin",
             "created_at": datetime.now(timezone.utc).isoformat()
         })
-        logger.info("Created default admin user: %s", admin_email)
 
     # 3. Seed Farmers if empty
     farmer_count = await db.farmers.count_documents({})
@@ -208,16 +230,16 @@ async def startup_event():
             {"name": "Pak Hasan Basri", "village": "Makekal Hulu", "phone": "081234567806", "notes": "Petani TBS & Berondol", "created_at": datetime.now(timezone.utc).isoformat()},
         ]
         await db.farmers.insert_many(sample_farmers)
-        logger.info("Seeded initial farmers list.")
 
     # 4. Indexes
     await db.users.create_index("email", unique=True)
+    await db.login_attempts.create_index("identifier")
     await db.purchase_transactions.create_index("local_id")
     await db.sales_trips.create_index("local_id")
     await db.operational_expenses.create_index("local_id")
 
 
-# ----------------- AUTH ROUTES ----------------- #
+# ----------------- AUTH ROUTES WITH BRUTE FORCE LOCKOUT ----------------- #
 
 @api_router.get("/auth/check-init")
 async def check_admin_init():
@@ -228,7 +250,6 @@ async def check_admin_init():
 async def setup_initial_admin(user_data: UserCreate, response: Response):
     user_count = await db.users.count_documents({})
     if user_count > 0:
-        # Check if already initialized, but allow if forced or valid
         existing = await db.users.find_one({"email": user_data.email.lower()})
         if existing:
             raise HTTPException(status_code=400, detail="Pengguna dengan email ini sudah terdaftar.")
@@ -261,12 +282,13 @@ async def setup_initial_admin(user_data: UserCreate, response: Response):
     }
 
 @api_router.post("/auth/login")
-async def login(credentials: UserLogin, response: Response):
+async def login(credentials: UserLogin, request: Request, response: Response):
     email = credentials.email.lower().strip()
+
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(credentials.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Email atau password salah.")
-    
+
     user_id = str(user["_id"])
     token = create_access_token(user_id, email, user.get("role", "pengelola"))
     
@@ -351,12 +373,9 @@ async def create_farmer(payload: FarmerCreate):
 # ----------------- STOCK POOL & WAC CALCULATION ----------------- #
 
 async def compute_virtual_stock_pool():
-    # 1. Aggregate all purchases by commodity
     purchases = await db.purchase_transactions.find().to_list(10000)
-    # 2. Aggregate all sales trips dispatched weight & returned grade B
     trips = await db.sales_trips.find().to_list(5000)
 
-    # Total Purchased
     total_tbs_bought_kg = 0.0
     total_tbs_bought_cost = 0.0
     total_berondol_bought_kg = 0.0
@@ -373,38 +392,37 @@ async def compute_virtual_stock_pool():
             total_tbs_bought_kg += w
             total_tbs_bought_cost += cost
 
-    # Total Dispatched from Trips
     total_tbs_dispatched_kg = 0.0
     total_berondol_dispatched_kg = 0.0
     total_grade_b_returned_kg = 0.0
 
     for t in trips:
-        ctype = t.get("commodity_type", "TBS").upper()
-        disp_w = float(t.get("dispatched_weight_kg", 0.0))
         ret_b = float(t.get("grade_b_returned_kg", 0.0))
-
         total_grade_b_returned_kg += ret_b
-        if ctype == "BERONDOL":
-            total_berondol_dispatched_kg += disp_w
-        elif ctype == "MIXED":
-            # If mixed, split by grade weights if available or treat as TBS
-            total_tbs_dispatched_kg += disp_w
-        else:
-            total_tbs_dispatched_kg += disp_w
 
-    # Grade B bawa pulang returned into Berondol Pool
-    # WAC TBS Calculation
+        # Check dual dispatched breakdown first
+        tbs_d = float(t.get("tbs_dispatched_kg", 0.0))
+        brd_d = float(t.get("berondol_dispatched_kg", 0.0))
+        
+        if tbs_d > 0 or brd_d > 0:
+            total_tbs_dispatched_kg += tbs_d
+            total_berondol_dispatched_kg += brd_d
+        else:
+            ctype = t.get("commodity_type", "TBS").upper()
+            disp_w = float(t.get("dispatched_weight_kg", 0.0))
+            if ctype == "BERONDOL":
+                total_berondol_dispatched_kg += disp_w
+            else:
+                total_tbs_dispatched_kg += disp_w
+
     wac_tbs = (total_tbs_bought_cost / total_tbs_bought_kg) if total_tbs_bought_kg > 0 else 2450.0
-    # Berondol pool gets extra weight from returned Grade B evaluated at TBS WAC
     berondol_effective_bought_kg = total_berondol_bought_kg + total_grade_b_returned_kg
     berondol_effective_bought_cost = total_berondol_bought_cost + (total_grade_b_returned_kg * wac_tbs)
     wac_berondol = (berondol_effective_bought_cost / berondol_effective_bought_kg) if berondol_effective_bought_kg > 0 else 2700.0
 
-    # Net Pending in Pool
     pending_tbs_kg = max(0.0, total_tbs_bought_kg - total_tbs_dispatched_kg)
     pending_berondol_kg = max(0.0, berondol_effective_bought_kg - total_berondol_dispatched_kg)
     total_pending_kg = pending_tbs_kg + pending_berondol_kg
-
     total_pending_value = (pending_tbs_kg * wac_tbs) + (pending_berondol_kg * wac_berondol)
 
     settings = await db.app_settings.find_one({"setting_id": "default"}) or {}
@@ -430,10 +448,10 @@ async def get_stock_pool_status():
     return await compute_virtual_stock_pool()
 
 
-# ----------------- PURCHASES (ENTRI TIMBANG LAPANGAN) ----------------- #
+# ----------------- PURCHASES CRUD (ENTRI TIMBANG & EDIT & BACKDATE) ----------------- #
 
 @api_router.get("/purchases")
-async def list_purchases(limit: int = 100):
+async def list_purchases(limit: int = 200):
     cursor = db.purchase_transactions.find().sort("timestamp", -1).limit(limit)
     items = await cursor.to_list(limit)
     return [convert_mongo_id(item) for item in items]
@@ -444,7 +462,6 @@ async def create_purchase(payload: PurchaseTransactionCreate):
     ts = payload.timestamp or datetime.now(timezone.utc).isoformat()
     total = payload.total_cost if payload.total_cost is not None else (payload.field_weight_kg * payload.price_per_kg)
     
-    # Auto register farmer if not existing
     farmer_name = payload.farmer_name.strip()
     if farmer_name:
         existing_farmer = await db.farmers.find_one({"name": {"$regex": f"^{farmer_name}$", "$options": "i"}})
@@ -457,7 +474,6 @@ async def create_purchase(payload: PurchaseTransactionCreate):
                 "created_at": ts
             })
 
-    # Update last price in settings
     if payload.commodity_type.upper() == "BERONDOL":
         await db.app_settings.update_one({"setting_id": "default"}, {"$set": {"last_price_berondol": payload.price_per_kg}})
     else:
@@ -477,7 +493,6 @@ async def create_purchase(payload: PurchaseTransactionCreate):
         "synced_at": datetime.now(timezone.utc).isoformat()
     }
     
-    # Check if duplicate local_id already exists (idempotent sync)
     existing = await db.purchase_transactions.find_one({"local_id": local_id})
     if existing:
         await db.purchase_transactions.update_one({"local_id": local_id}, {"$set": doc})
@@ -490,11 +505,53 @@ async def create_purchase(payload: PurchaseTransactionCreate):
     doc_res["id"] = str(res.inserted_id)
     return doc_res
 
+@api_router.put("/purchases/{purchase_id}")
+async def update_purchase(purchase_id: str, payload: PurchaseTransactionCreate):
+    total = payload.total_cost if payload.total_cost is not None else (payload.field_weight_kg * payload.price_per_kg)
+    update_data = {
+        "farmer_name": payload.farmer_name.strip(),
+        "commodity_type": payload.commodity_type.upper(),
+        "field_weight_kg": float(payload.field_weight_kg),
+        "price_per_kg": float(payload.price_per_kg),
+        "total_cost": round(float(total), 2),
+        "photo_url": payload.photo_url or "",
+        "notes": payload.notes or "",
+        "status": payload.status or "PAID",
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    if payload.timestamp:
+        update_data["timestamp"] = payload.timestamp
 
-# ----------------- SALES TRIPS (JUAL KE LOADING) ----------------- #
+    # Search by local_id or Mongo ObjectId
+    res = await db.purchase_transactions.update_one({"local_id": purchase_id}, {"$set": update_data})
+    if res.matched_count == 0:
+        try:
+            from bson import ObjectId
+            res = await db.purchase_transactions.update_one({"_id": ObjectId(purchase_id)}, {"$set": update_data})
+        except Exception:
+            pass
+
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Data pembelian tidak ditemukan.")
+
+    return {"message": "Data timbangan berhasil diperbarui", "updated": update_data}
+
+@api_router.delete("/purchases/{purchase_id}")
+async def delete_purchase(purchase_id: str):
+    res = await db.purchase_transactions.delete_one({"local_id": purchase_id})
+    if res.deleted_count == 0:
+        try:
+            from bson import ObjectId
+            res = await db.purchase_transactions.delete_one({"_id": ObjectId(purchase_id)})
+        except Exception:
+            pass
+    return {"message": "Data pembelian berhasil dihapus"}
+
+
+# ----------------- SALES TRIPS CRUD (DUAL COMMODITY IN 1 TRIP & EDIT & BACKDATE) ----------------- #
 
 @api_router.get("/trips")
-async def list_sales_trips(limit: int = 100):
+async def list_sales_trips(limit: int = 200):
     cursor = db.sales_trips.find().sort("trip_date", -1).limit(limit)
     items = await cursor.to_list(limit)
     return [convert_mongo_id(item) for item in items]
@@ -504,51 +561,74 @@ async def create_sales_trip(payload: SalesTripCreate):
     local_id = payload.local_id or f"TRIP-{uuid.uuid4().hex[:10].upper()}"
     trip_date = payload.trip_date or datetime.now(timezone.utc).isoformat()
 
-    # Get current WAC for COGS allocation
     pool = await compute_virtual_stock_pool()
-    wac = pool["wac_berondol"] if payload.commodity_type.upper() == "BERONDOL" else pool["wac_tbs"]
+    wac_tbs = pool["wac_tbs"]
+    wac_berondol = pool["wac_berondol"]
 
-    dispatched_w = float(payload.dispatched_weight_kg)
-    loading_w = float(payload.loading_weight_kg)
+    # Dual or Single Weights
+    tbs_disp = float(payload.tbs_dispatched_kg)
+    brd_disp = float(payload.berondol_dispatched_kg)
+    tbs_load = float(payload.tbs_loading_kg)
+    brd_load = float(payload.berondol_loading_kg)
+
+    # Fallback to general dispatched & loading if dual wasn't explicitly given
+    if tbs_disp == 0 and brd_disp == 0 and payload.dispatched_weight_kg > 0:
+        if payload.commodity_type.upper() == "BERONDOL":
+            brd_disp = payload.dispatched_weight_kg
+            brd_load = payload.loading_weight_kg
+        else:
+            tbs_disp = payload.dispatched_weight_kg
+            tbs_load = payload.loading_weight_kg
+
+    total_disp_w = tbs_disp + brd_disp
+    total_load_w = tbs_load + brd_load
 
     # Susut Timbangan
-    weight_loss_kg = max(0.0, dispatched_w - loading_w)
-    weight_loss_pct = (weight_loss_kg / dispatched_w * 100.0) if dispatched_w > 0 else 0.0
+    weight_loss_kg = max(0.0, total_disp_w - total_load_w)
+    weight_loss_pct = (weight_loss_kg / total_disp_w * 100.0) if total_disp_w > 0 else 0.0
 
-    # Potongan Wajib 2% pada berat loading
-    deduction_2pct_kg = loading_w * 0.02
-    billable_weight_kg = loading_w * 0.98
+    # Potongan Wajib 2% pada total berat loading
+    deduction_2pct_kg = total_load_w * 0.02
+    billable_weight_kg = total_load_w * 0.98
 
-    # Grade splits
+    # TBS Grading & Revenue
     grade_a = payload.grade_a or GradeSplit()
     grade_b_sold = payload.grade_b_sold or GradeSplit()
     retur_b_kg = float(payload.grade_b_returned_kg)
 
     rev_a = grade_a.weight_kg * grade_a.price_per_kg if grade_a.revenue == 0 else grade_a.revenue
     rev_b = grade_b_sold.weight_kg * grade_b_sold.price_per_kg if grade_b_sold.revenue == 0 else grade_b_sold.revenue
-    total_revenue = rev_a + rev_b
+    
+    # Berondol Direct Revenue in same trip
+    berondol_sold = payload.berondol_sold or GradeSplit()
+    rev_brd = berondol_sold.weight_kg * berondol_sold.price_per_kg if berondol_sold.revenue == 0 else berondol_sold.revenue
+    
+    total_revenue = rev_a + rev_b + rev_brd
 
-    # COGS allocated: Dispatched weight minus returned Grade B (which stays in Berondol pool)
-    net_dispatched_sold_kg = max(0.0, dispatched_w - retur_b_kg)
-    cogs_allocated = payload.cogs_allocated if payload.cogs_allocated is not None else (net_dispatched_sold_kg * wac)
+    # COGS allocated
+    # TBS sold = TBS dispatched minus returned Grade B (which stays in Berondol pool)
+    net_tbs_sold_kg = max(0.0, tbs_disp - retur_b_kg)
+    cogs_tbs = net_tbs_sold_kg * wac_tbs
+    cogs_brd = brd_disp * wac_berondol
+    cogs_allocated = payload.cogs_allocated if payload.cogs_allocated is not None else (cogs_tbs + cogs_brd)
 
-    # Logistics Calculation
-    # Transport: Total dispatched / loading tonase * rate per ton
-    tonase = dispatched_w / 1000.0
+    # Logistics Calculation:
+    # Transport: Total tonase * rate per ton
+    tonase = total_disp_w / 1000.0
     transport_cost = payload.transport_cost if payload.transport_cost is not None else (tonase * payload.transport_rate_per_ton)
 
-    # Bongkar Muat: Berat loading * rate
-    unloading_cost = payload.unloading_cost
-    if unloading_cost is None:
-        if payload.commodity_type.upper() == "BERONDOL":
-            unloading_cost = loading_w * payload.unloading_rate_berondol
-        else:
-            unloading_cost = loading_w * payload.unloading_rate_tbs
+    # Bongkar Muat (Default: TBS Rp 40.000/ton, Berondol Rp 60.000/ton)
+    rate_tbs_ton = payload.unloading_rate_tbs_per_ton or 40000.0
+    rate_brd_ton = payload.unloading_rate_berondol_per_ton or 60000.0
+    
+    tbs_load_ton = tbs_load / 1000.0
+    brd_load_ton = brd_load / 1000.0
+    unloading_cost = payload.unloading_cost if payload.unloading_cost is not None else ((tbs_load_ton * rate_tbs_ton) + (brd_load_ton * rate_brd_ton))
 
     tips = float(payload.tips)
     total_logistic_expenses = transport_cost + unloading_cost + tips
 
-    # Net Trade Margin
+    # Net Margin
     net_margin = total_revenue - cogs_allocated - total_logistic_expenses
 
     # Settings for anomaly threshold
@@ -561,9 +641,13 @@ async def create_sales_trip(payload: SalesTripCreate):
         "trip_date": trip_date,
         "loading_name": payload.loading_name or "Loading RAM Makekal",
         "nota_number": payload.nota_number or f"NOTA-{local_id[-6:]}",
-        "commodity_type": payload.commodity_type.upper(),
-        "dispatched_weight_kg": round(dispatched_w, 2),
-        "loading_weight_kg": round(loading_w, 2),
+        "commodity_type": "DUAL" if (tbs_disp > 0 and brd_disp > 0) else (payload.commodity_type.upper()),
+        "dispatched_weight_kg": round(total_disp_w, 2),
+        "loading_weight_kg": round(total_load_w, 2),
+        "tbs_dispatched_kg": round(tbs_disp, 2),
+        "tbs_loading_kg": round(tbs_load, 2),
+        "berondol_dispatched_kg": round(brd_disp, 2),
+        "berondol_loading_kg": round(brd_load, 2),
         "weight_loss_kg": round(weight_loss_kg, 2),
         "weight_loss_pct": round(weight_loss_pct, 2),
         "is_anomaly": is_anomaly,
@@ -580,10 +664,18 @@ async def create_sales_trip(payload: SalesTripCreate):
             "revenue": round(rev_b, 2)
         },
         "grade_b_returned_kg": round(retur_b_kg, 2),
+        "berondol_sold": {
+            "weight_kg": round(berondol_sold.weight_kg, 2),
+            "price_per_kg": round(berondol_sold.price_per_kg, 2),
+            "revenue": round(rev_brd, 2)
+        },
         "cogs_allocated": round(cogs_allocated, 2),
-        "wac_unit_applied": round(wac, 2),
+        "wac_tbs_applied": round(wac_tbs, 2),
+        "wac_berondol_applied": round(wac_berondol, 2),
         "transport_rate_per_ton": payload.transport_rate_per_ton,
         "transport_cost": round(transport_cost, 2),
+        "unloading_rate_tbs_per_ton": rate_tbs_ton,
+        "unloading_rate_berondol_per_ton": rate_brd_ton,
         "unloading_cost": round(unloading_cost, 2),
         "tips": round(tips, 2),
         "total_logistic_expenses": round(total_logistic_expenses, 2),
@@ -608,9 +700,25 @@ async def create_sales_trip(payload: SalesTripCreate):
     doc_res["id"] = str(res.inserted_id)
     return doc_res
 
+@api_router.put("/trips/{trip_id}")
+async def update_sales_trip(trip_id: str, payload: SalesTripCreate):
+    # Re-run trip creation calculations and update
+    res = await create_sales_trip(payload)
+    return {"message": "Data trip berhasil diperbarui", "trip": res}
+
+@api_router.delete("/trips/{trip_id}")
+async def delete_sales_trip(trip_id: str):
+    res = await db.sales_trips.delete_one({"local_id": trip_id})
+    if res.deleted_count == 0:
+        try:
+            from bson import ObjectId
+            res = await db.sales_trips.delete_one({"_id": ObjectId(trip_id)})
+        except Exception:
+            pass
+    return {"message": "Data trip berhasil dihapus"}
+
 @api_router.patch("/trips/{trip_id}/pay")
 async def mark_trip_paid(trip_id: str, current_user: dict = Depends(get_current_user)):
-    # Can find by MongoDB _id or local_id
     query = {"local_id": trip_id}
     trip = await db.sales_trips.find_one(query)
     if not trip:
@@ -628,10 +736,10 @@ async def mark_trip_paid(trip_id: str, current_user: dict = Depends(get_current_
     return {"message": "Status pembayaran berhasil diubah menjadi Lunas (COD)"}
 
 
-# ----------------- OPERATIONAL EXPENSES (BIAYA TERISOLASI) ----------------- #
+# ----------------- OPERATIONAL EXPENSES CRUD ----------------- #
 
 @api_router.get("/expenses")
-async def list_expenses(limit: int = 100):
+async def list_expenses(limit: int = 200):
     cursor = db.operational_expenses.find().sort("timestamp", -1).limit(limit)
     items = await cursor.to_list(limit)
     return [convert_mongo_id(item) for item in items]
@@ -663,6 +771,17 @@ async def create_expense(payload: OperationalExpenseCreate):
     doc_res = convert_mongo_id(doc)
     doc_res["id"] = str(res.inserted_id)
     return doc_res
+
+@api_router.delete("/expenses/{expense_id}")
+async def delete_expense(expense_id: str):
+    res = await db.operational_expenses.delete_one({"local_id": expense_id})
+    if res.deleted_count == 0:
+        try:
+            from bson import ObjectId
+            res = await db.operational_expenses.delete_one({"_id": ObjectId(expense_id)})
+        except Exception:
+            pass
+    return {"message": "Data pengeluaran berhasil dihapus"}
 
 
 # ----------------- BATCH SYNC ENGINE ----------------- #
@@ -708,38 +827,31 @@ async def batch_sync(payload: BatchSyncPayload):
     }
 
 
-# ----------------- DASHBOARD METRICS & AUDIT ----------------- #
+# ----------------- DASHBOARD METRICS ----------------- #
 
 @api_router.get("/dashboard/stats")
 async def get_dashboard_stats():
-    # 1. Pool Status
     pool = await compute_virtual_stock_pool()
-
-    # 2. Trips Aggregation
     trips = await db.sales_trips.find().sort("trip_date", -1).to_list(1000)
-    purchases = await db.purchase_transactions.find().to_list(5000)
-    expenses = await db.operational_expenses.find().to_list(1000)
+    purchases = await db.purchase_transactions.find().sort("timestamp", -1).to_list(5000)
+    expenses = await db.operational_expenses.find().sort("timestamp", -1).to_list(1000)
 
     total_revenue = sum(float(t.get("total_revenue", 0.0)) for t in trips)
     total_cogs = sum(float(t.get("cogs_allocated", 0.0)) for t in trips)
     total_logistics = sum(float(t.get("total_logistic_expenses", 0.0)) for t in trips)
     total_net_margin = sum(float(t.get("net_margin", 0.0)) for t in trips)
 
-    # Isolated Operational Expenses
     total_operational_expenses = sum(float(e.get("amount", 0.0)) for e in expenses)
-    # Total Coop Net Profit = Margin Dagang Bersih - Beban Operasional Terisolasi
     coop_net_profit = total_net_margin - total_operational_expenses
 
-    # Total Purchase Volume
     total_purchase_cost = sum(float(p.get("total_cost", 0.0)) for p in purchases)
     total_purchase_weight = sum(float(p.get("field_weight_kg", 0.0)) for p in purchases)
 
-    # Anomaly Trips (> 5% Shrinkage)
     settings = await db.app_settings.find_one({"setting_id": "default"}) or {}
     shrinkage_threshold = float(settings.get("shrinkage_alert_pct", 5.0))
 
     anomaly_trips = []
-    pending_receivables = []  # Piutang Loading
+    pending_receivables = []
 
     for t in trips:
         t_clean = convert_mongo_id(t)
@@ -753,9 +865,9 @@ async def get_dashboard_stats():
 
     total_receivables_amount = sum(float(t.get("total_revenue", 0.0)) for t in pending_receivables)
 
-    # Recent Transactions
-    recent_purchases = [convert_mongo_id(p) for p in purchases[-10:]]
-    recent_trips = [convert_mongo_id(t) for t in trips[:10]]
+    recent_purchases = [convert_mongo_id(p) for p in purchases[:15]]
+    recent_trips = [convert_mongo_id(t) for t in trips[:15]]
+    recent_expenses = [convert_mongo_id(e) for e in expenses[:15]]
 
     return {
         "stock_pool": pool,
@@ -776,7 +888,8 @@ async def get_dashboard_stats():
         "anomaly_trips": anomaly_trips,
         "pending_receivables": pending_receivables,
         "recent_purchases": recent_purchases,
-        "recent_trips": recent_trips
+        "recent_trips": recent_trips,
+        "recent_expenses": recent_expenses
     }
 
 
@@ -784,14 +897,12 @@ async def get_dashboard_stats():
 
 @api_router.post("/seed-demo")
 async def seed_demo_data():
-    # Clear previous operational data but keep farmers and admin
     await db.purchase_transactions.delete_many({})
     await db.sales_trips.delete_many({})
     await db.operational_expenses.delete_many({})
 
     now = datetime.now(timezone.utc)
 
-    # 1. Sample Purchases (TBS & Berondol)
     demo_purchases = [
         {"local_id": "PUR-DEMO001", "farmer_name": "Pak Budi Makekal", "commodity_type": "TBS", "field_weight_kg": 650.0, "price_per_kg": 2450.0, "total_cost": 1592500.0, "status": "PAID", "timestamp": (now - timedelta(days=2, hours=3)).isoformat()},
         {"local_id": "PUR-DEMO002", "farmer_name": "Pak Tumenggung Marituha", "commodity_type": "TBS", "field_weight_kg": 850.0, "price_per_kg": 2450.0, "total_cost": 2082500.0, "status": "PAID", "timestamp": (now - timedelta(days=2, hours=1)).isoformat()},
@@ -802,35 +913,43 @@ async def seed_demo_data():
     ]
     await db.purchase_transactions.insert_many(demo_purchases)
 
-    # 2. Sample Trips: 1 Normal Trip and 1 Anomaly Trip (>5% shrinkage) and 1 Pending Piutang
+    # Demo Trips: Including a dual commodity trip
     demo_trips = [
         {
             "local_id": "TRIP-DEMO001",
             "trip_date": (now - timedelta(days=1)).isoformat(),
             "loading_name": "RAM Sawit Sejahtera",
             "nota_number": "NOTA-RAM-881",
-            "commodity_type": "TBS",
-            "dispatched_weight_kg": 1500.0,
-            "loading_weight_kg": 1475.0,  # susut 25 kg (1.67% - Normal)
-            "weight_loss_kg": 25.0,
-            "weight_loss_pct": 1.67,
+            "commodity_type": "DUAL",
+            "dispatched_weight_kg": 1700.0,
+            "loading_weight_kg": 1670.0,
+            "tbs_dispatched_kg": 1500.0,
+            "tbs_loading_kg": 1475.0,
+            "berondol_dispatched_kg": 200.0,
+            "berondol_loading_kg": 195.0,
+            "weight_loss_kg": 30.0,
+            "weight_loss_pct": 1.76,
             "is_anomaly": False,
-            "deduction_2pct_kg": 29.5,
-            "billable_weight_kg": 1445.5,
+            "deduction_2pct_kg": 33.4,
+            "billable_weight_kg": 1636.6,
             "grade_a": {"weight_kg": 1400.0, "price_per_kg": 2650.0, "revenue": 3710000.0},
             "grade_b_sold": {"weight_kg": 45.5, "price_per_kg": 2200.0, "revenue": 100100.0},
             "grade_b_returned_kg": 0.0,
-            "cogs_allocated": 3675000.0,
-            "wac_unit_applied": 2450.0,
+            "berondol_sold": {"weight_kg": 191.1, "price_per_kg": 2900.0, "revenue": 554190.0},
+            "cogs_allocated": 4215000.0,
+            "wac_tbs_applied": 2450.0,
+            "wac_berondol_applied": 2700.0,
             "transport_rate_per_ton": 70000.0,
-            "transport_cost": 105000.0,
-            "unloading_cost": 36875.0,
+            "transport_cost": 119000.0,
+            "unloading_rate_tbs_per_ton": 40000.0,
+            "unloading_rate_berondol_per_ton": 60000.0,
+            "unloading_cost": 70700.0,
             "tips": 20000.0,
-            "total_logistic_expenses": 161875.0,
-            "total_revenue": 3810100.0,
-            "net_margin": -26775.0,
+            "total_logistic_expenses": 209700.0,
+            "total_revenue": 4364290.0,
+            "net_margin": -60410.0,
             "payment_status": "COD",
-            "notes": "Trip perdana lancar.",
+            "notes": "Trip gabungan TBS dan Berondol lancar.",
             "created_at": (now - timedelta(days=1)).isoformat()
         },
         {
@@ -840,7 +959,11 @@ async def seed_demo_data():
             "nota_number": "NOTA-RAM-904",
             "commodity_type": "TBS",
             "dispatched_weight_kg": 800.0,
-            "loading_weight_kg": 745.0,  # susut 55 kg (6.88% - ANOMALI > 5%)
+            "loading_weight_kg": 745.0,
+            "tbs_dispatched_kg": 800.0,
+            "tbs_loading_kg": 745.0,
+            "berondol_dispatched_kg": 0.0,
+            "berondol_loading_kg": 0.0,
             "weight_loss_kg": 55.0,
             "weight_loss_pct": 6.88,
             "is_anomaly": True,
@@ -848,16 +971,20 @@ async def seed_demo_data():
             "billable_weight_kg": 730.1,
             "grade_a": {"weight_kg": 680.0, "price_per_kg": 2700.0, "revenue": 1836000.0},
             "grade_b_sold": {"weight_kg": 50.1, "price_per_kg": 2300.0, "revenue": 115230.0},
-            "grade_b_returned_kg": 20.0,  # retur bawa pulang 20kg
+            "grade_b_returned_kg": 20.0,
+            "berondol_sold": {"weight_kg": 0.0, "price_per_kg": 0.0, "revenue": 0.0},
             "cogs_allocated": 1911000.0,
-            "wac_unit_applied": 2450.0,
+            "wac_tbs_applied": 2450.0,
+            "wac_berondol_applied": 2700.0,
             "transport_rate_per_ton": 70000.0,
             "transport_cost": 56000.0,
-            "unloading_cost": 18625.0,
+            "unloading_rate_tbs_per_ton": 40000.0,
+            "unloading_rate_berondol_per_ton": 60000.0,
+            "unloading_cost": 29800.0,
             "tips": 10000.0,
-            "total_logistic_expenses": 84625.0,
+            "total_logistic_expenses": 95800.0,
             "total_revenue": 1951230.0,
-            "net_margin": -44395.0,
+            "net_margin": -55570.0,
             "payment_status": "PENDING",
             "due_date": (now + timedelta(days=3)).strftime("%Y-%m-%d"),
             "notes": "Susut tinggi karena cuaca panas & selisih timbang loading.",
@@ -866,7 +993,6 @@ async def seed_demo_data():
     ]
     await db.sales_trips.insert_many(demo_trips)
 
-    # 3. Sample Operational Expenses
     demo_expenses = [
         {"local_id": "EXP-DEMO001", "category": "Makan Pekerja", "amount": 75000.0, "description": "Makan siang 3 buruh timbang", "worker_count": 3, "timestamp": (now - timedelta(days=1, hours=3)).isoformat()},
         {"local_id": "EXP-DEMO002", "category": "BBM/Transport Lapangan", "amount": 50000.0, "description": "Bensin genset penerangan timbangan", "worker_count": 0, "timestamp": (now - timedelta(hours=5)).isoformat()},
@@ -881,14 +1007,14 @@ async def seed_demo_data():
 app.include_router(api_router)
 
 # CORS configuration
-cors_origins_env = os.environ.get("CORS_ORIGINS", "")
-if cors_origins_env and cors_origins_env != "*":
-    origins_list = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+origins_env = os.environ.get("CORS_ORIGINS", "")
+if origins_env and origins_env != "*":
+    origins_list = [o.strip() for o in origins_env.split(",") if o.strip()]
 else:
     origins_list = [
+        "https://palm-ledger-hub.preview.emergentagent.com",
         "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://palm-ledger-hub.preview.emergentagent.com"
+        "http://127.0.0.1:3000"
     ]
 
 app.add_middleware(
