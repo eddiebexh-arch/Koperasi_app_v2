@@ -18,7 +18,8 @@ import {
   RefreshCcw,
   Sparkles,
   Search,
-  Plus
+  Plus,
+  Lock
 } from 'lucide-react';
 import { AdminAuthModal } from './AdminAuthModal';
 import { DigitalReceiptModal } from '../DigitalReceiptModal';
@@ -27,7 +28,7 @@ const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || '';
 const API = `${BACKEND_URL}/api`;
 
 export function ManagerDashboard() {
-  const { user } = useAuth();
+  const { user, isReady } = useAuth();
   const { triggerSync } = useSync();
 
   const [activeTab, setActiveTab] = useState('SUMMARY'); // 'SUMMARY' | 'ANOMALIES' | 'RECEIVABLES' | 'FARMERS' | 'SETTINGS'
@@ -53,7 +54,7 @@ export function ManagerDashboard() {
     try {
       setLoading(true);
       const [statsRes, farmersRes, settingsRes] = await Promise.all([
-        axios.get(`${API}/dashboard/stats`),
+        axios.get(`${API}/dashboard/stats`, { withCredentials: true }),
         axios.get(`${API}/farmers`),
         axios.get(`${API}/settings`)
       ]);
@@ -77,8 +78,12 @@ export function ManagerDashboard() {
   };
 
   useEffect(() => {
-    loadDashboardData();
-  }, []);
+    if (user) {
+      loadDashboardData();
+    } else {
+      setLoading(false);
+    }
+  }, [user]);
 
   const handleSeedDemo = async () => {
     try {
@@ -149,6 +154,32 @@ export function ManagerDashboard() {
   const stockPool = stats?.stock_pool || {};
   const anomalyTrips = stats?.anomaly_trips || [];
   const pendingReceivables = stats?.pending_receivables || [];
+
+  // Auth gate: user must log in to view dashboard data
+  if (!user) {
+    return (
+      <div className="bg-white rounded-2xl border-2 border-[#1E4620] shadow-xl p-8 sm:p-12 max-w-lg mx-auto text-center space-y-4">
+        <div className="w-16 h-16 mx-auto rounded-2xl bg-[#1E4620] text-[#D4A373] flex items-center justify-center">
+          <Lock className="w-8 h-8" />
+        </div>
+        <div>
+          <h3 className="text-xl font-black text-gray-900 uppercase tracking-tight">Login Pengelola Diperlukan</h3>
+          <p className="text-sm text-gray-600 mt-2">
+            Dashboard Pemantauan hanya bisa diakses oleh pengelola BUB Makekal Hulu setelah login.
+          </p>
+        </div>
+        <button
+          type="button"
+          data-testid="open-manager-login-btn"
+          onClick={() => setAuthModalOpen(true)}
+          className="w-full py-3 px-6 rounded-xl bg-[#1E4620] hover:bg-[#2C662F] text-white font-black text-sm shadow-md transition-all"
+        >
+          Login Sekarang
+        </button>
+        <AdminAuthModal isOpen={authModalOpen} onClose={() => setAuthModalOpen(false)} />
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">

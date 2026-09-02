@@ -64,6 +64,12 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
   const [brdSoldPrice, setBrdSoldPrice] = useState(
     initialData?.berondol_sold?.price_per_kg ? String(initialData.berondol_sold.price_per_kg) : '2900'
   );
+  const [brdGbWeight, setBrdGbWeight] = useState(
+    initialData?.berondol_grade_b_sold?.weight_kg ? String(initialData.berondol_grade_b_sold.weight_kg) : ''
+  );
+  const [brdGbPrice, setBrdGbPrice] = useState(
+    initialData?.berondol_grade_b_sold?.price_per_kg ? String(initialData.berondol_grade_b_sold.price_per_kg) : '2400'
+  );
 
   // Logistics
   const [transportRateType, setTransportRateType] = useState(
@@ -127,7 +133,11 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
   const brdS_p = parseFloat(brdSoldPrice) || 0;
   const brdS_rev = brdS_w * brdS_p;
 
-  const totalRevenue = gA_rev + gB_rev + brdS_rev;
+  const brdGb_w = parseFloat(brdGbWeight) || 0;
+  const brdGb_p = parseFloat(brdGbPrice) || 0;
+  const brdGb_rev = brdGb_w * brdGb_p;
+
+  const totalRevenue = gA_rev + gB_rev + brdS_rev + brdGb_rev;
 
   // COGS
   const wacTbs = stockPool.wac_tbs || 2450;
@@ -212,6 +222,7 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
         grade_b_sold: { weight_kg: gB_w, price_per_kg: gB_p, revenue: Math.round(gB_rev) },
         grade_b_returned_kg: returB_kg,
         berondol_sold: { weight_kg: brdS_w, price_per_kg: brdS_p, revenue: Math.round(brdS_rev) },
+        berondol_grade_b_sold: { weight_kg: brdGb_w, price_per_kg: brdGb_p, revenue: Math.round(brdGb_rev) },
         // Costs
         cogs_allocated: cogsAllocated,
         wac_tbs_applied: wacTbs,
@@ -261,6 +272,7 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
         setGradeBWeight('');
         setGradeBReturnedKg('');
         setBrdSoldWeight('');
+        setBrdGbWeight('');
         setNotaNumber('');
         setTripDateLocal(nowLocalDateTimeInput());
       }
@@ -466,7 +478,7 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
           <div className="bg-white p-4 sm:p-5 rounded-2xl border-2 border-gray-200 space-y-4">
             <div className="flex justify-between items-center">
               <h3 className="text-xs font-black uppercase text-gray-700 tracking-wider">
-                2. Penjualan: TBS (Grade A / B) & Berondol Langsung
+                2. Penjualan: TBS (Grade A/B) & Berondol (Grade A/B)
               </h3>
               {tbsLoad > 0 && (
                 <button
@@ -480,8 +492,8 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
               )}
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              {/* Grade A */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+              {/* TBS Grade A */}
               <div className="bg-emerald-50/60 p-3.5 rounded-xl border border-emerald-200 space-y-2">
                 <span className="text-xs font-black text-emerald-900 uppercase block">TBS Grade A</span>
                 <div className="grid grid-cols-2 gap-2">
@@ -511,7 +523,7 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
                 </div>
               </div>
 
-              {/* Grade B Sold */}
+              {/* TBS Grade B Sold */}
               <div className="bg-amber-50/60 p-3.5 rounded-xl border border-amber-200 space-y-2">
                 <span className="text-xs font-black text-amber-900 uppercase block">TBS Grade B (Diskon)</span>
                 <div className="grid grid-cols-2 gap-2">
@@ -541,9 +553,9 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
                 </div>
               </div>
 
-              {/* Berondol Direct Sale */}
-              <div className="bg-orange-50/60 p-3.5 rounded-xl border border-orange-200 space-y-2">
-                <span className="text-xs font-black text-orange-900 uppercase block">Berondol Langsung</span>
+              {/* Berondol Grade A */}
+              <div className="bg-orange-50/70 p-3.5 rounded-xl border border-orange-200 space-y-2">
+                <span className="text-xs font-black text-orange-900 uppercase block">Berondol Grade A</span>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
                     <label className="text-[11px] text-gray-600 block">Berat (Kg)</label>
@@ -568,6 +580,36 @@ export function SalesTripEntry({ prefilledDispatchedKg, initialData, onDone }) {
                 </div>
                 <div className="text-right text-xs font-black text-orange-900">
                   Rp {Math.round(brdS_rev).toLocaleString('id-ID')}
+                </div>
+              </div>
+
+              {/* Berondol Grade B */}
+              <div className="bg-rose-50/70 p-3.5 rounded-xl border border-rose-200 space-y-2">
+                <span className="text-xs font-black text-rose-900 uppercase block">Berondol Grade B (Diskon)</span>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[11px] text-gray-600 block">Berat (Kg)</label>
+                    <input
+                      type="number" step="0.1"
+                      data-testid="brd-gb-weight-input"
+                      value={brdGbWeight}
+                      onChange={(e) => setBrdGbWeight(e.target.value)}
+                      className="w-full font-mono font-bold px-3 py-2 rounded-lg border border-gray-300 outline-none text-right"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-gray-600 block">Harga/Kg</label>
+                    <input
+                      type="number"
+                      data-testid="brd-gb-price-input"
+                      value={brdGbPrice}
+                      onChange={(e) => setBrdGbPrice(e.target.value)}
+                      className="w-full font-mono font-bold px-3 py-2 rounded-lg border border-gray-300 outline-none text-right"
+                    />
+                  </div>
+                </div>
+                <div className="text-right text-xs font-black text-rose-900">
+                  Rp {Math.round(brdGb_rev).toLocaleString('id-ID')}
                 </div>
               </div>
             </div>

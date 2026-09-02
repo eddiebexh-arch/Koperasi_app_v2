@@ -151,7 +151,13 @@ export function SyncProvider({ children }) {
           await axios.delete(`${API}/${path}/${encodeURIComponent(d.local_id)}`);
           await db.deleted_queue.update(d.id, { synced: 1 });
         } catch (err) {
-          console.warn('Delete sync failed for', d, err?.response?.status);
+          const status = err?.response?.status;
+          // 404 means already gone on server - safe to mark synced
+          if (status === 404) {
+            await db.deleted_queue.update(d.id, { synced: 1 });
+          } else {
+            console.warn('Delete sync failed for', d, status);
+          }
         }
       }
 

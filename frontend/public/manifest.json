@@ -1,0 +1,25 @@
+{
+  "short_name": "BUB Makekal",
+  "name": "BUB Makekal Hulu - Timbangan Sawit",
+  "description": "Pencatatan jual-beli sawit offline-first untuk BUB Makekal Hulu. Timbangan lapangan, pool stok, trip loading, dashboard pengelola.",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#1E4620",
+  "background_color": "#FEFAE0",
+  "lang": "id"
+}

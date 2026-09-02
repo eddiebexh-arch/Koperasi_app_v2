@@ -1,0 +1,37 @@
+{
+  "summary": "Backend-only regression re-test (iteration 4) of BUB Makekal Hulu palm oil app via the public URL. Both iteration_3 criticals are CONFIRMED FIXED. Extended /app/backend/tests/backend_test.py from 19 to 28 pytest tests (added: PUT /trips/{unknown} -> 404 + no orphan, PUT /trips/{lid} in-place update with orphan detection, DELETE 404 for purchases/trips/expenses, dashboard stats via httpOnly cookie only, app-level CORS credentials check, regex-safety of farmer_name). Result: 27/28 passed (96%), stable across 3 consecutive runs (parallel + serial). The single failure is a genuine, reproducible 500: an unescaped farmer_name interpolated into a Mongo $regex.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/purchases (and POST /api/farmers)", "issue": "farmer_name is interpolated raw into a Mongo $regex ({'$regex': f'^{farmer_name}$'}) at server.py:357 and :468. A name containing regex metacharacters (verified with 'TEST_Pak (Budi') raises pymongo OperationFailure 'Regular expression is invalid: missing closing parenthesis' -> HTTP 500 Internal Server Error and the purchase is NOT saved. Real users typing '(', '[', '*', '+' or '?' in a farmer name will silently lose data. Fix: re.escape(farmer_name) before building the regex.", "priority": "CRITICAL"}
+    ],
+    "minor": [
+      {"endpoint": "POST/PUT/DELETE /api/purchases, /api/trips, /api/expenses, POST /api/sync, POST /api/seed-demo, GET /api/stock-pool", "issue": "Still unauthenticated (only /auth/me, /dashboard/stats and PATCH /trips/{id}/pay require JWT). POST /api/seed-demo is especially dangerous: it delete_many()s purchase_transactions, sales_trips and operational_expenses with no auth. Previously reported in iteration_3, not fixed."},
+      {"endpoint": "startup seed_admin (server.py:208-220)", "issue": "Playbook item 5 not implemented: the admin is only inserted when absent. If ADMIN_PASSWORD in .env changes, the existing admin's password_hash is never updated, so the documented credential silently drifts from the DB. Add an else-branch that re-hashes and updates password_hash when it no longer verifies."},
+      {"endpoint": "PUT /api/purchases/{id}", "issue": "Uses PurchaseTransactionCreate, so partial updates are not supported and omitted optional fields (photo_url, notes) are reset to defaults. Previously reported, not fixed."},
+      {"endpoint": "POST /api/sync", "issue": "Per-item exceptions are swallowed and only logged; synced_counts still counts them, so an offline client marks failed records as synced. Return a per-item failures array. Previously reported, not fixed."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "CRITICAL: re.escape() farmer_name before the Mongo $regex lookup in server.py:357 and server.py:468 (currently HTTP 500 + data loss for names with regex metacharacters).",
+    "Protect write endpoints with JWT, at minimum POST /api/seed-demo which wipes all transactional collections.",
+    "Make seed_admin idempotent-with-update: re-hash and update password_hash when ADMIN_PASSWORD changes."
+  ],
+  "critical_code_review_comments": [
+    "Verified fixed: PUT /trips/{trip_id} now looks up by local_id (and ObjectId fallback), 404s when absent, and binds payload.local_id = trip_id before delegating to create_sales_trip -> no more orphan inserts.",
+    "Verified fixed: GET /dashboard/stats now has Depends(get_current_user); returns 401 unauthenticated and 200 with Bearer token or httpOnly cookie.",
+    "Verified fixed: DELETE /purchases|/trips|/expenses/{id} now raise 404 when deleted_count == 0.",
+    "server.py is 1060 lines - split into routers/ (auth, purchases, trips, expenses, dashboard) + services/stock_pool.py.",
+    "compute_virtual_stock_pool() pulls up to 10k purchases + 5k trips into memory on every stock-pool/trip/sync/dashboard call; migrate to an aggregation pipeline.",
+    "PUT /trips re-uses create_sales_trip as an upsert; acceptable now, but the 'update' path replaces the whole document, so any field not in SalesTripCreate (e.g. payment flags set by PATCH /trips/{id}/pay) is silently reset on edit - worth verifying against the paid-trip flow."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "96% (27/28)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Created and cleaned up TEST_-prefixed purchases/trips/expenses (PUR-TEST*, TRIP-TEST*, EXP-TEST*) via the session teardown fixture. Additionally deleted 5 auto-created TEST_ farmer records left behind by the purchase auto-farmer-registration (farmers collection back to the 8 real/demo records). DB verified clean: 6 purchases, 2 trips, 3 expenses, 0 TEST_ leftovers.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "admin@makekal.id / SawitMakekal2026! (from /app/memory/test_credentials.md). Playbook checks: (1) password_hash starts with $2b$ PASS; (2) httpOnly cookie set on login PASS (public response also gets Secure/SameSite=None/Partitioned added by the edge); (3) CORS allow_credentials=True with explicit origin list PASS at app level (localhost:8001 echoes the exact origin) - the preview edge proxy rewrites allow-origin to '*' and sometimes drops allow-credentials on OPTIONS, which is infra behaviour, not an app bug; (4) brute-force lockout intentionally REMOVED per user request - 7 consecutive wrong passwords all 401, no 429, correct password still works PASS; (5) seed_admin does NOT update an existing admin when the password changes - FAIL, see minor issues.",
+  "context_for_next_testing_agent": "pytest suite: /app/backend/tests/backend_test.py (28 tests) runs against REACT_APP_BACKEND_URL, self-cleans via the session 'created' fixture. It is xdist-safe now: trip-orphan assertions match on payload fingerprint instead of total trip count (total-count assertions were flaky under -n auto because other tests create trips concurrently). Passing: auth (no lockout, bcrypt, cookie), stock-pool schema, backdated purchase/trip/expense, DUAL commodity trip math (total_revenue 3,391,000; unloading_cost 56,900 default / 72,600 custom), PUT purchase recompute, 404s on PUT/DELETE unknown ids for all three resources, PUT trip in-place update with and without local_id in body, WAC + grade_b_returned revert after trip delete, sync idempotency, dashboard 401/200 (Bearer + cookie). Only TestRegexSafety::test_purchase_with_regex_special_char_farmer_name fails - re-run it after the re.escape() fix. Frontend was not tested in this iteration.",
+  "rca_of_the_issue": "Remaining failure RCA: server.py:468 in create_purchase does `existing_farmer = await db.farmers.find_one({'name': {'$regex': f'^{farmer_name}$', '$options': 'i'}})` (same pattern at :357 in create_farmer). MongoDB compiles the interpolated string as a PCRE, so any unbalanced metacharacter raises OperationFailure code 51091 ('Regular expression is invalid'), which is not caught and surfaces as a 500 before the purchase document is inserted -> user-visible save failure and data loss. Reproduction: POST /api/purchases with farmer_name='Pak (Budi'. Mitigation: wrap with re.escape(farmer_name) (and optionally add a unique case-insensitive collation index on farmers.name instead of a regex lookup)."
+}

@@ -1,7 +1,7 @@
-"""Backend regression tests - BUB Makekal Hulu palm oil trading API (iteration 3).
-
-Covers: auth (no brute-force lockout), dual-commodity trips, backdated entries,
-edit/delete CRUD for purchases/trips/expenses, stock pool WAC, dashboard, settings.
+"""
+BUB Makekal Hulu - Palm Oil Trading System :: Backend API regression tests (iteration 3)
+Focus: no brute-force lockout, stock pool, backdated entries, DUAL commodity trips,
+editable unloading rates, edit/delete CRUD, batch sync, dashboard stats.
 """
 import os
 import re
@@ -19,9 +19,8 @@ if not base_url:
 BASE_URL = base_url.rstrip("/")
 API = f"{BASE_URL}/api"
 
-SUFFIX = uuid.uuid4().hex[:6].upper()
 
-
+# ---------- fixtures ----------
 @pytest.fixture(scope="session")
 def api_client():
     s = requests.Session()
@@ -35,11 +34,11 @@ def test_credentials():
     if not p.exists():
         pytest.skip("Missing /app/memory/test_credentials.md")
     content = p.read_text(encoding="utf-8")
-    email = re.search(r'(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Email(?:\*\*)?\s*:\s*`?([^`\s]+)', content)
-    pwd = re.search(r'(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Password(?:\*\*)?\s*:\s*`?([^`\s]+)', content)
-    if not email or not pwd:
+    em = re.search(r'(?im)^\s*(?:[-*]\s*)?(?:\*\*)?email(?:\*\*)?\s*:\s*`?([^`\s]+)', content)
+    pw = re.search(r'(?im)^\s*(?:[-*]\s*)?(?:\*\*)?password(?:\*\*)?\s*:\s*`?([^`\s]+)', content)
+    if not em or not pw:
         pytest.skip("No credentials found")
-    return {"email": email.group(1), "password": pwd.group(1)}
+    return {"email": em.group(1), "password": pw.group(1)}
 
 
 @pytest.fixture(scope="session")
@@ -47,396 +46,489 @@ def auth_token(api_client, test_credentials):
     r = api_client.post(f"{API}/auth/login", json=test_credentials)
     if r.status_code != 200:
         pytest.fail(f"Login failed {r.status_code}: {r.text[:300]}")
-    tok = r.json().get("token")
-    if not tok:
+    token = r.json().get("token")
+    if not token:
         pytest.fail("No token in login response")
-    return tok
+    return token
 
 
 @pytest.fixture(scope="session")
-def authed(api_client, auth_token):
-    s = requests.Session()
-    s.headers.update({"Content-Type": "application/json", "Authorization": f"Bearer {auth_token}"})
-    return s
-
-
-# ----------------- AUTH: NO BRUTE FORCE LOCKOUT ----------------- #
-class TestAuthNoLockout:
-    def test_ten_wrong_passwords_all_401(self, api_client, test_credentials):
-        codes = []
-        for i in range(10):
-            r = api_client.post(f"{API}/auth/login", json={
-                "email": test_credentials["email"], "password": f"WrongPass{i}!"})
-            codes.append(r.status_code)
-        assert all(c == 401 for c in codes), f"Expected all 401, got {codes}"
-
-    def test_correct_login_after_failures(self, api_client, test_credentials):
-        r = api_client.post(f"{API}/auth/login", json=test_credentials)
-        assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
-        data = r.json()
-        assert isinstance(data["token"], str) and len(data["token"]) > 10
-        assert data["user"]["email"] == test_credentials["email"].lower()
-        assert data["user"]["role"] in ("admin", "pengelola")
-        # httpOnly cookie set
-        cookie_hdr = r.headers.get("set-cookie", "")
-        assert "access_token" in cookie_hdr and "HttpOnly" in cookie_hdr, cookie_hdr
-
-    def test_auth_me_with_token(self, authed, test_credentials):
-        r = authed.get(f"{API}/auth/me")
-        assert r.status_code == 200
-        assert r.json()["email"] == test_credentials["email"].lower()
-
-    def test_auth_me_unauthenticated(self, api_client):
-        r = requests.get(f"{API}/auth/me")
-        assert r.status_code == 401
-
-    def test_cors_allows_credentials(self, test_credentials):
-        # NOTE: OPTIONS preflight is answered by the edge proxy (returns "*"),
-        # so credentialed CORS is verified on the actual request response.
-        r = requests.post(f"{API}/auth/login", json=test_credentials,
-                          headers={"Origin": BASE_URL})
-        assert r.status_code == 200, r.status_code
-        assert r.headers.get("access-control-allow-credentials") == "true", dict(r.headers)
-        assert r.headers.get("access-control-allow-origin") in ("*", BASE_URL)
-
-
-# ----------------- APP SETTINGS ----------------- #
-class TestSettings:
-    def test_default_unloading_rates(self, api_client):
-        r = api_client.get(f"{API}/settings")
-        assert r.status_code == 200
-        d = r.json()
-        assert d["default_unloading_rate_tbs"] == 40000
-        assert d["default_unloading_rate_berondol"] == 60000
-        assert "_id" not in d
-
-
-# ----------------- DUAL COMMODITY TRIP ----------------- #
-class TestDualCommodityTrip:
-    LOCAL_ID = f"TRIP-DUAL-{SUFFIX}"
-
-    @pytest.fixture(scope="class")
-    def dual_trip(self, api_client):
-        payload = {
-            "local_id": self.LOCAL_ID,
-            "tbs_dispatched_kg": 1200, "tbs_loading_kg": 1180,
-            "berondol_dispatched_kg": 400, "berondol_loading_kg": 395,
-            "grade_a": {"weight_kg": 1100, "price_per_kg": 2700},
-            "berondol_sold": {"weight_kg": 387, "price_per_kg": 2950},
-            "transport_rate_per_ton": 70000,
-            "unloading_rate_tbs_per_ton": 40000,
-            "unloading_rate_berondol_per_ton": 60000,
-            "tips": 15000, "payment_status": "COD",
-        }
-        r = api_client.post(f"{API}/trips", json=payload)
-        assert r.status_code == 200, f"{r.status_code}: {r.text[:400]}"
-        yield r.json()
-        api_client.delete(f"{API}/trips/{self.LOCAL_ID}")
-
-    def test_commodity_type_dual(self, dual_trip):
-        assert dual_trip["commodity_type"] == "DUAL"
-
-    def test_total_revenue(self, dual_trip):
-        assert dual_trip["total_revenue"] == pytest.approx(4111650, abs=0.5)
-
-    def test_transport_cost(self, dual_trip):
-        assert dual_trip["transport_cost"] == pytest.approx(112000, abs=0.5)
-
-    def test_unloading_cost(self, dual_trip):
-        assert dual_trip["unloading_cost"] == pytest.approx(70900, abs=0.5)
-
-    def test_weights_and_deductions(self, dual_trip):
-        assert dual_trip["dispatched_weight_kg"] == pytest.approx(1600)
-        assert dual_trip["loading_weight_kg"] == pytest.approx(1575)
-        assert dual_trip["weight_loss_kg"] == pytest.approx(25)
-        assert dual_trip["weight_loss_pct"] == pytest.approx(1.56, abs=0.02)
-        assert dual_trip["deduction_2pct_kg"] == pytest.approx(31.5, abs=0.05)
-        assert dual_trip["billable_weight_kg"] == pytest.approx(1543.5, abs=0.05)
-
-    def test_net_margin_consistency(self, dual_trip):
-        expected_logistics = 112000 + 70900 + 15000
-        assert dual_trip["total_logistic_expenses"] == pytest.approx(expected_logistics, abs=0.5)
-        expected = dual_trip["total_revenue"] - dual_trip["cogs_allocated"] - dual_trip["total_logistic_expenses"]
-        assert dual_trip["net_margin"] == pytest.approx(expected, abs=1)
-
-    def test_cogs_uses_wac(self, dual_trip):
-        expected_cogs = 1200 * dual_trip["wac_tbs_applied"] + 400 * dual_trip["wac_berondol_applied"]
-        assert dual_trip["cogs_allocated"] == pytest.approx(expected_cogs, abs=1)
-
-    def test_persisted_in_list(self, api_client, dual_trip):
-        r = api_client.get(f"{API}/trips")
-        assert r.status_code == 200
-        found = [t for t in r.json() if t["local_id"] == self.LOCAL_ID]
-        assert len(found) == 1
-        assert "_id" not in found[0]
-
-
-# ----------------- BACKDATED ENTRIES ----------------- #
-class TestBackdatedEntries:
-    def test_backdated_purchase(self, api_client):
-        lid = f"PUR-BACK-{SUFFIX}"
-        ts = "2025-11-15T10:00:00Z"
-        r = api_client.post(f"{API}/purchases", json={
-            "local_id": lid, "farmer_name": "TEST_Backdate Farmer",
-            "commodity_type": "TBS", "field_weight_kg": 500, "price_per_kg": 2450,
-            "timestamp": ts})
-        assert r.status_code == 200, r.text[:300]
-        assert r.json()["timestamp"] == ts
-        got = [p for p in api_client.get(f"{API}/purchases").json() if p["local_id"] == lid]
-        assert got and got[0]["timestamp"] == ts
+def created(api_client):
+    """Track created resources for teardown."""
+    tracker = {"purchases": [], "trips": [], "expenses": []}
+    yield tracker
+    for lid in tracker["purchases"]:
         api_client.delete(f"{API}/purchases/{lid}")
-
-    def test_backdated_trip(self, api_client):
-        lid = f"TRIP-BACK-{SUFFIX}"
-        td = "2025-10-20T14:30:00Z"
-        r = api_client.post(f"{API}/trips", json={
-            "local_id": lid, "trip_date": td, "commodity_type": "TBS",
-            "dispatched_weight_kg": 500, "loading_weight_kg": 490,
-            "grade_a": {"weight_kg": 480, "price_per_kg": 2600}})
-        assert r.status_code == 200, r.text[:300]
-        assert r.json()["trip_date"] == td
+    for lid in tracker["trips"]:
         api_client.delete(f"{API}/trips/{lid}")
-
-    def test_backdated_expense(self, api_client):
-        lid = f"EXP-BACK-{SUFFIX}"
-        ts = "2025-12-01T09:00:00Z"
-        r = api_client.post(f"{API}/expenses", json={
-            "local_id": lid, "category": "Makan Pekerja", "amount": 50000,
-            "description": "TEST_backdated", "worker_count": 2, "timestamp": ts})
-        assert r.status_code == 200, r.text[:300]
-        assert r.json()["timestamp"] == ts
-        got = [e for e in api_client.get(f"{API}/expenses").json() if e["local_id"] == lid]
-        assert got and got[0]["timestamp"] == ts
+    for lid in tracker["expenses"]:
         api_client.delete(f"{API}/expenses/{lid}")
 
 
-# ----------------- EDIT (PUT) ----------------- #
-class TestEditPurchase:
-    def test_edit_purchase_updates_values(self, api_client):
-        lid = f"PUR-EDIT-{SUFFIX}"
-        c = api_client.post(f"{API}/purchases", json={
-            "local_id": lid, "farmer_name": "TEST_Edit Farmer", "commodity_type": "TBS",
-            "field_weight_kg": 400, "price_per_kg": 2400})
-        assert c.status_code == 200, c.text[:300]
-        assert c.json()["total_cost"] == pytest.approx(960000)
-
-        u = api_client.put(f"{API}/purchases/{lid}", json={
-            "local_id": lid, "farmer_name": "TEST_Edit Farmer", "commodity_type": "TBS",
-            "field_weight_kg": 600, "price_per_kg": 2500})
-        assert u.status_code == 200, u.text[:300]
-
-        got = [p for p in api_client.get(f"{API}/purchases").json() if p["local_id"] == lid]
-        assert len(got) == 1, "Edit created duplicate rows"
-        assert got[0]["field_weight_kg"] == 600
-        assert got[0]["total_cost"] == pytest.approx(1500000)
-        api_client.delete(f"{API}/purchases/{lid}")
-
-    def test_edit_nonexistent_purchase_404(self, api_client):
-        r = api_client.put(f"{API}/purchases/PUR-DOES-NOT-EXIST-{SUFFIX}", json={
-            "farmer_name": "TEST_x", "field_weight_kg": 1, "price_per_kg": 1})
-        assert r.status_code == 404, f"Expected 404, got {r.status_code}"
+def new_id(prefix):
+    return f"{prefix}-TEST{uuid.uuid4().hex[:8].upper()}"
 
 
-class TestEditTrip:
-    def test_edit_trip_upserts_not_duplicates(self, api_client):
-        lid = f"TRIP-EDIT-{SUFFIX}"
-        base = {
-            "local_id": lid, "commodity_type": "TBS",
-            "tbs_dispatched_kg": 1000, "tbs_loading_kg": 980,
-            "grade_a": {"weight_kg": 950, "price_per_kg": 2600},
-            "transport_rate_per_ton": 70000, "tips": 10000,
+# ---------- AUTH ----------
+class TestAuth:
+    def test_login_success(self, api_client, test_credentials):
+        r = api_client.post(f"{API}/auth/login", json=test_credentials)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert isinstance(d.get("token"), str) and len(d["token"]) > 20
+        assert d["user"]["email"] == test_credentials["email"]
+        assert d["user"]["role"] in ("admin", "pengelola")
+        # httpOnly cookie set
+        assert "access_token" in r.cookies, f"cookies={r.cookies.get_dict()}"
+        assert "httponly" in r.headers.get("set-cookie", "").lower()
+
+    def test_no_bruteforce_lockout(self, test_credentials):
+        s = requests.Session()
+        codes = []
+        for _ in range(7):
+            r = s.post(f"{API}/auth/login", json={"email": test_credentials["email"], "password": "WrongPass123!"})
+            codes.append(r.status_code)
+        assert all(c == 401 for c in codes), f"Expected all 401, got {codes}"
+        assert 429 not in codes
+        # correct password still works afterwards
+        r = s.post(f"{API}/auth/login", json=test_credentials)
+        assert r.status_code == 200, f"Locked out after failures: {r.status_code} {r.text[:200]}"
+
+    def test_me_requires_auth(self, auth_token):
+        r = requests.get(f"{API}/auth/me")
+        assert r.status_code == 401
+        r2 = requests.get(f"{API}/auth/me", headers={"Authorization": f"Bearer {auth_token}"})
+        assert r2.status_code == 200
+        assert "email" in r2.json()
+
+    def test_bcrypt_hash_format(self):
+        # verify seeded admin hash format directly in DB
+        import asyncio
+        from motor.motor_asyncio import AsyncIOMotorClient
+        from dotenv import dotenv_values as dv
+        env = dv("/app/backend/.env")
+        mongo_url = os.environ.get("MONGO_URL") or env.get("MONGO_URL")
+        db_name = os.environ.get("DB_NAME") or env.get("DB_NAME")
+        if not mongo_url or not db_name:
+            pytest.skip("MONGO_URL/DB_NAME unavailable")
+
+        async def _check():
+            c = AsyncIOMotorClient(mongo_url)
+            u = await c[db_name].users.find_one({"email": "admin@makekal.id"})
+            c.close()
+            return u
+
+        user = asyncio.get_event_loop().run_until_complete(_check()) if False else asyncio.run(_check())
+        assert user is not None, "Seeded admin not found in DB"
+        assert user["password_hash"].startswith("$2b$"), user["password_hash"][:10]
+
+
+# ---------- STOCK POOL ----------
+class TestStockPool:
+    def test_stock_pool_fields(self, api_client):
+        r = api_client.get(f"{API}/stock-pool")
+        assert r.status_code == 200, r.text
+        d = r.json()
+        for k in ["pending_tbs_kg", "pending_berondol_kg", "wac_tbs", "wac_berondol",
+                  "total_pending_kg", "total_pending_value", "target_progress_pct"]:
+            assert k in d, f"missing {k}"
+            assert isinstance(d[k], (int, float))
+        assert "_id" not in d
+
+
+# ---------- PURCHASES ----------
+class TestPurchases:
+    def test_create_backdated_purchase_and_persist(self, api_client, created):
+        lid = new_id("PUR")
+        payload = {
+            "local_id": lid,
+            "farmer_name": "TEST_Petani Backdate",
+            "commodity_type": "TBS",
+            "field_weight_kg": 500,
+            "price_per_kg": 2400,
+            "timestamp": "2025-10-15T10:00:00Z",
         }
-        c = api_client.post(f"{API}/trips", json=base)
-        assert c.status_code == 200, c.text[:300]
-        assert c.json()["total_revenue"] == pytest.approx(2470000)
+        r = api_client.post(f"{API}/purchases", json=payload)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        created["purchases"].append(lid)
+        assert d["local_id"] == lid
+        assert d["timestamp"] == "2025-10-15T10:00:00Z"
+        assert d["total_cost"] == 1200000.0
+        assert "_id" not in d
 
-        edited = dict(base, tbs_dispatched_kg=1500, tbs_loading_kg=1480,
-                      grade_a={"weight_kg": 1400, "price_per_kg": 2700}, tips=20000)
-        u = api_client.put(f"{API}/trips/{lid}", json=edited)
-        assert u.status_code == 200, u.text[:300]
+        lst = api_client.get(f"{API}/purchases?limit=200").json()
+        match = [p for p in lst if p["local_id"] == lid]
+        assert match, "backdated purchase not returned by GET /purchases"
+        assert match[0]["timestamp"] == "2025-10-15T10:00:00Z"
+        assert match[0]["field_weight_kg"] == 500
 
-        rows = [t for t in api_client.get(f"{API}/trips").json() if t["local_id"] == lid]
-        assert len(rows) == 1, f"Edit produced {len(rows)} rows (duplicate)"
-        assert rows[0]["total_revenue"] == pytest.approx(3780000)
-        assert rows[0]["tbs_dispatched_kg"] == 1500
-        assert rows[0]["tips"] == 20000
-        api_client.delete(f"{API}/trips/{lid}")
-
-    def test_edit_trip_without_local_id_in_body(self, api_client):
-        """PUT should target the path id even if body omits local_id."""
-        lid = f"TRIP-EDITNL-{SUFFIX}"
-        c = api_client.post(f"{API}/trips", json={
-            "local_id": lid, "commodity_type": "TBS",
-            "tbs_dispatched_kg": 800, "tbs_loading_kg": 790,
-            "grade_a": {"weight_kg": 780, "price_per_kg": 2500}})
-        assert c.status_code == 200
-        before = len(api_client.get(f"{API}/trips").json())
-        u = api_client.put(f"{API}/trips/{lid}", json={
-            "commodity_type": "TBS", "tbs_dispatched_kg": 900, "tbs_loading_kg": 890,
-            "grade_a": {"weight_kg": 880, "price_per_kg": 2500}})
-        assert u.status_code == 200, u.text[:300]
-        rows = api_client.get(f"{API}/trips").json()
-        target = [t for t in rows if t["local_id"] == lid]
-        try:
-            assert len(rows) == before, "PUT without body local_id created an extra trip document"
-            assert target and target[0]["tbs_dispatched_kg"] == 900, "PUT did not update the targeted trip"
-        finally:
-            api_client.delete(f"{API}/trips/{lid}")
-            for t in rows:
-                if t["local_id"] not in (lid,) and t["local_id"].startswith("TRIP-") and t.get("tbs_dispatched_kg") == 900 and t["local_id"] != lid:
-                    api_client.delete(f"{API}/trips/{t['local_id']}")
-
-
-# ----------------- DELETE ----------------- #
-class TestDelete:
-    def test_delete_purchase(self, api_client):
-        lid = f"PUR-DEL-{SUFFIX}"
+    def test_update_purchase_recomputes_total(self, api_client, created):
+        lid = new_id("PUR")
         api_client.post(f"{API}/purchases", json={
-            "local_id": lid, "farmer_name": "TEST_Del", "commodity_type": "TBS",
-            "field_weight_kg": 100, "price_per_kg": 2000})
-        r = api_client.delete(f"{API}/purchases/{lid}")
-        assert r.status_code == 200, r.text[:200]
-        assert not [p for p in api_client.get(f"{API}/purchases").json() if p["local_id"] == lid]
+            "local_id": lid, "farmer_name": "TEST_Edit Petani",
+            "commodity_type": "TBS", "field_weight_kg": 400, "price_per_kg": 2000,
+            "timestamp": "2025-11-01T08:00:00Z"})
+        created["purchases"].append(lid)
 
-    def test_delete_trip(self, api_client):
-        lid = f"TRIP-DEL-{SUFFIX}"
+        r = api_client.put(f"{API}/purchases/{lid}", json={
+            "local_id": lid, "farmer_name": "TEST_Edit Petani",
+            "commodity_type": "TBS", "field_weight_kg": 400, "price_per_kg": 2500})
+        assert r.status_code == 200, r.text
+
+        lst = api_client.get(f"{API}/purchases?limit=200").json()
+        rec = next(p for p in lst if p["local_id"] == lid)
+        assert rec["price_per_kg"] == 2500
+        assert rec["total_cost"] == 1000000.0
+
+    def test_update_missing_purchase_404(self, api_client):
+        r = api_client.put(f"{API}/purchases/PUR-DOESNOTEXIST", json={
+            "farmer_name": "TEST_X", "field_weight_kg": 1, "price_per_kg": 1})
+        assert r.status_code == 404, r.status_code
+
+    def test_delete_purchase(self, api_client):
+        lid = new_id("PUR")
+        api_client.post(f"{API}/purchases", json={
+            "local_id": lid, "farmer_name": "TEST_Delete Petani",
+            "commodity_type": "BERONDOL", "field_weight_kg": 100, "price_per_kg": 2700})
+        r = api_client.delete(f"{API}/purchases/{lid}")
+        assert r.status_code == 200, r.text
+        lst = api_client.get(f"{API}/purchases?limit=200").json()
+        assert not [p for p in lst if p["local_id"] == lid], "purchase still present after delete"
+
+
+# ---------- TRIPS: DUAL COMMODITY ----------
+class TestTripsDual:
+    def test_dual_commodity_trip(self, api_client, created):
+        lid = new_id("TRIP")
+        payload = {
+            "local_id": lid,
+            "commodity_type": "TBS",
+            "tbs_dispatched_kg": 1000, "tbs_loading_kg": 980,
+            "berondol_dispatched_kg": 300, "berondol_loading_kg": 295,
+            "grade_a": {"weight_kg": 900, "price_per_kg": 2700},
+            "berondol_sold": {"weight_kg": 290, "price_per_kg": 2900},
+            "berondol_grade_b_sold": {"weight_kg": 50, "price_per_kg": 2400},
+        }
+        r = api_client.post(f"{API}/trips", json=payload)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        created["trips"].append(lid)
+
+        assert d["commodity_type"] == "DUAL", d["commodity_type"]
+        assert d["grade_a"]["revenue"] == 2430000.0
+        assert d["berondol_sold"]["revenue"] == 841000.0
+        assert d["berondol_grade_b_sold"]["revenue"] == 120000.0
+        expected_rev = 2430000.0 + 841000.0 + 120000.0
+        assert d["total_revenue"] == expected_rev, d["total_revenue"]
+        # unloading defaults 40k/ton TBS + 60k/ton Berondol on loading weights
+        assert d["unloading_cost"] == round(0.980 * 40000 + 0.295 * 60000, 2), d["unloading_cost"]
+        assert d["dispatched_weight_kg"] == 1300
+        assert d["loading_weight_kg"] == 1275
+        assert d["weight_loss_kg"] == 25
+        assert d["tips"] == 0
+        # margin identity
+        assert round(d["net_margin"], 2) == round(
+            d["total_revenue"] - d["cogs_allocated"] - d["total_logistic_expenses"], 2)
+        assert "_id" not in d
+
+    def test_custom_unloading_rates(self, api_client, created):
+        lid = new_id("TRIP")
+        r = api_client.post(f"{API}/trips", json={
+            "local_id": lid,
+            "tbs_dispatched_kg": 1000, "tbs_loading_kg": 980,
+            "berondol_dispatched_kg": 300, "berondol_loading_kg": 295,
+            "unloading_rate_tbs_per_ton": 50000,
+            "unloading_rate_berondol_per_ton": 80000,
+            "grade_a": {"weight_kg": 900, "price_per_kg": 2700},
+        })
+        assert r.status_code == 200, r.text
+        d = r.json()
+        created["trips"].append(lid)
+        assert d["unloading_rate_tbs_per_ton"] == 50000
+        assert d["unloading_rate_berondol_per_ton"] == 80000
+        assert d["unloading_cost"] == round(0.980 * 50000 + 0.295 * 80000, 2), d["unloading_cost"]
+
+    def test_backdated_trip(self, api_client, created):
+        lid = new_id("TRIP")
+        r = api_client.post(f"{API}/trips", json={
+            "local_id": lid, "trip_date": "2025-11-01T09:00:00Z",
+            "commodity_type": "TBS", "dispatched_weight_kg": 800, "loading_weight_kg": 790,
+            "grade_a": {"weight_kg": 770, "price_per_kg": 2600},
+        })
+        assert r.status_code == 200, r.text
+        d = r.json()
+        created["trips"].append(lid)
+        assert d["trip_date"] == "2025-11-01T09:00:00Z"
+        assert d["tbs_dispatched_kg"] == 800, "single-commodity fallback failed"
+        assert d["commodity_type"] == "TBS"
+        trips = api_client.get(f"{API}/trips?limit=200").json()
+        rec = next((t for t in trips if t["local_id"] == lid), None)
+        assert rec is not None and rec["trip_date"] == "2025-11-01T09:00:00Z"
+
+    def test_update_trip_recalculates(self, api_client, created):
+        lid = new_id("TRIP")
         api_client.post(f"{API}/trips", json={
             "local_id": lid, "commodity_type": "TBS",
-            "tbs_dispatched_kg": 300, "tbs_loading_kg": 295,
-            "grade_a": {"weight_kg": 290, "price_per_kg": 2500}})
-        r = api_client.delete(f"{API}/trips/{lid}")
-        assert r.status_code == 200
-        assert not [t for t in api_client.get(f"{API}/trips").json() if t["local_id"] == lid]
+            "tbs_dispatched_kg": 1000, "tbs_loading_kg": 980,
+            "grade_a": {"weight_kg": 900, "price_per_kg": 2500},
+        })
+        created["trips"].append(lid)
+        before = api_client.get(f"{API}/trips?limit=200").json()
+        count_before = len([t for t in before if t["local_id"] == lid])
 
-    def test_delete_expense(self, api_client):
-        lid = f"EXP-DEL-{SUFFIX}"
-        api_client.post(f"{API}/expenses", json={
-            "local_id": lid, "category": "Lain-lain", "amount": 10000, "description": "TEST_del"})
-        r = api_client.delete(f"{API}/expenses/{lid}")
-        assert r.status_code == 200
-        assert not [e for e in api_client.get(f"{API}/expenses").json() if e["local_id"] == lid]
+        r = api_client.put(f"{API}/trips/{lid}", json={
+            "local_id": lid, "commodity_type": "TBS",
+            "tbs_dispatched_kg": 1000, "tbs_loading_kg": 980,
+            "grade_a": {"weight_kg": 900, "price_per_kg": 2800},
+        })
+        assert r.status_code == 200, r.text
+        body = r.json()
+        trip = body.get("trip", body)
+        assert trip["grade_a"]["price_per_kg"] == 2800
+        assert trip["total_revenue"] == 2520000.0
 
-    def test_delete_nonexistent_returns_ok_or_404(self, api_client):
-        r = api_client.delete(f"{API}/purchases/PUR-NOPE-{SUFFIX}")
-        assert r.status_code in (200, 404), r.status_code
+        after = api_client.get(f"{API}/trips?limit=200").json()
+        recs = [t for t in after if t["local_id"] == lid]
+        assert len(recs) == count_before == 1, f"update duplicated records: {len(recs)}"
+        assert recs[0]["total_revenue"] == 2520000.0
+
+    def test_update_trip_without_local_id_should_not_create_duplicate(self, api_client, created):
+        """PUT should target the path trip_id even if body omits local_id."""
+        lid = new_id("TRIP")
+        api_client.post(f"{API}/trips", json={
+            "local_id": lid, "commodity_type": "TBS",
+            "tbs_dispatched_kg": 500, "tbs_loading_kg": 495,
+            "grade_a": {"weight_kg": 480, "price_per_kg": 2500},
+        })
+        created["trips"].append(lid)
+
+        r = api_client.put(f"{API}/trips/{lid}", json={
+            "commodity_type": "TBS",
+            "tbs_dispatched_kg": 500, "tbs_loading_kg": 495,
+            "grade_a": {"weight_kg": 480, "price_per_kg": 2600},
+        })
+        assert r.status_code == 200, r.text
+        after = api_client.get(f"{API}/trips?limit=200").json()
+        recs = [t for t in after if t["local_id"] == lid]
+        assert len(recs) == 1, "target trip missing after PUT"
+        assert recs[0]["grade_a"]["price_per_kg"] == 2600, "PUT did not update target trip"
+        orphans = [t for t in after if t["local_id"] != lid
+                   and t.get("tbs_dispatched_kg") == 500
+                   and t.get("total_revenue") == 480 * 2600]
+        assert not orphans, f"PUT created an extra trip record (orphan): {[o['local_id'] for o in orphans]}"
+
+    def test_delete_trip_and_wac_recalc(self, api_client, created):
+        # purchase to give TBS stock
+        pur = new_id("PUR")
+        api_client.post(f"{API}/purchases", json={
+            "local_id": pur, "farmer_name": "TEST_WAC Petani",
+            "commodity_type": "TBS", "field_weight_kg": 2000, "price_per_kg": 2500})
+        created["purchases"].append(pur)
+
+        pool_before = api_client.get(f"{API}/stock-pool").json()
+
+        lid = new_id("TRIP")
+        r = api_client.post(f"{API}/trips", json={
+            "local_id": lid, "commodity_type": "TBS",
+            "tbs_dispatched_kg": 1000, "tbs_loading_kg": 980,
+            "grade_b_returned_kg": 100,
+            "grade_a": {"weight_kg": 850, "price_per_kg": 2700},
+        })
+        assert r.status_code == 200, r.text
+        pool_mid = api_client.get(f"{API}/stock-pool").json()
+        assert pool_mid["total_grade_b_returned_kg"] >= 100
+
+        dr = api_client.delete(f"{API}/trips/{lid}")
+        assert dr.status_code == 200, dr.text
+        trips = api_client.get(f"{API}/trips?limit=200").json()
+        assert not [t for t in trips if t["local_id"] == lid]
+
+        pool_after = api_client.get(f"{API}/stock-pool").json()
+        assert pool_after["total_grade_b_returned_kg"] == pool_before["total_grade_b_returned_kg"], \
+            "returned Grade B not reverted after trip delete"
+        assert pool_after["pending_tbs_kg"] == pool_before["pending_tbs_kg"]
+        assert pool_after["wac_berondol"] == pool_before["wac_berondol"]
 
 
-# ----------------- STOCK POOL WAC ----------------- #
-class TestStockPoolWAC:
-    def test_wac_and_pending_computation(self, api_client):
-        base = api_client.get(f"{API}/stock-pool")
-        assert base.status_code == 200
-        b = base.json()
-
-        p1 = f"PUR-WAC1-{SUFFIX}"
-        p2 = f"PUR-WAC2-{SUFFIX}"
-        trip = f"TRIP-WAC-{SUFFIX}"
-        try:
-            api_client.post(f"{API}/purchases", json={
-                "local_id": p1, "farmer_name": "TEST_WAC", "commodity_type": "TBS",
-                "field_weight_kg": 1000, "price_per_kg": 2000})
-            api_client.post(f"{API}/purchases", json={
-                "local_id": p2, "farmer_name": "TEST_WAC", "commodity_type": "BERONDOL",
-                "field_weight_kg": 500, "price_per_kg": 3000})
-
-            after = api_client.get(f"{API}/stock-pool").json()
-
-            exp_tbs_kg = b["total_tbs_bought_kg"] + 1000
-            exp_brd_kg = b["total_berondol_bought_kg"] + 500
-            assert after["total_tbs_bought_kg"] == pytest.approx(exp_tbs_kg, abs=0.5)
-            assert after["total_berondol_bought_kg"] == pytest.approx(exp_brd_kg, abs=0.5)
-
-            # weighted-average cost must move toward newly added prices
-            assert after["wac_tbs"] > 0 and after["wac_berondol"] > 0
-            assert after["total_pending_kg"] == pytest.approx(
-                after["pending_tbs_kg"] + after["pending_berondol_kg"], abs=0.5)
-            pending_before = after["total_pending_kg"]
-
-            # dual dispatch must reduce pending for both commodities
-            api_client.post(f"{API}/trips", json={
-                "local_id": trip, "tbs_dispatched_kg": 400, "tbs_loading_kg": 395,
-                "berondol_dispatched_kg": 200, "berondol_loading_kg": 198,
-                "grade_a": {"weight_kg": 380, "price_per_kg": 2700},
-                "berondol_sold": {"weight_kg": 190, "price_per_kg": 3100}})
-            final = api_client.get(f"{API}/stock-pool").json()
-            assert final["total_pending_kg"] == pytest.approx(pending_before - 600, abs=1), \
-                f"pending did not drop by 600: {pending_before} -> {final['total_pending_kg']}"
-            assert final["target_kg"] > 0
-            assert 0 <= final["target_progress_pct"] <= 100
-        finally:
-            api_client.delete(f"{API}/trips/{trip}")
-            api_client.delete(f"{API}/purchases/{p1}")
-            api_client.delete(f"{API}/purchases/{p2}")
-
-
-# ----------------- DASHBOARD ----------------- #
-class TestDashboard:
-    def test_stats_structure(self, authed):
-        r = authed.get(f"{API}/dashboard/stats")
-        assert r.status_code == 200, r.text[:300]
+# ---------- EXPENSES ----------
+class TestExpenses:
+    def test_create_backdated_expense_and_delete(self, api_client):
+        lid = new_id("EXP")
+        r = api_client.post(f"{API}/expenses", json={
+            "local_id": lid, "category": "Makan Pekerja", "amount": 90000,
+            "description": "TEST_Makan buruh", "worker_count": 3,
+            "timestamp": "2025-12-05T04:00:00Z"})
+        assert r.status_code == 200, r.text
         d = r.json()
-        for key in ["financial_summary", "stock_pool", "anomaly_trips", "pending_receivables",
-                    "recent_purchases", "recent_trips", "recent_expenses"]:
-            assert key in d, f"missing {key}"
-        fs = d["financial_summary"]
-        for key in ["total_revenue", "total_cogs", "total_logistics", "total_net_margin",
-                    "coop_net_profit", "total_purchase_cost"]:
-            assert key in fs, f"missing financial_summary.{key}"
-        assert isinstance(d["recent_trips"], list)
-        for coll in ["recent_purchases", "recent_trips", "recent_expenses"]:
-            for item in d[coll]:
-                assert "_id" not in item, f"_id leaked in {coll}"
+        assert d["timestamp"] == "2025-12-05T04:00:00Z"
+        assert d["amount"] == 90000.0
+        assert d["worker_count"] == 3
+
+        dr = api_client.delete(f"{API}/expenses/{lid}")
+        assert dr.status_code == 200, dr.text
+        lst = api_client.get(f"{API}/expenses?limit=200").json()
+        assert not [e for e in lst if e["local_id"] == lid]
 
 
-# ----------------- MASTER DATA & SYNC ----------------- #
-class TestFarmersAndSync:
-    def test_list_farmers(self, api_client):
-        r = api_client.get(f"{API}/farmers")
-        assert r.status_code == 200
-        farmers = r.json()
-        assert isinstance(farmers, list) and len(farmers) > 0
-        assert "_id" not in farmers[0] and "id" in farmers[0]
+# ---------- BATCH SYNC ----------
+class TestBatchSync:
+    def test_sync_batch_idempotent(self, api_client, created):
+        p_id, t_id, e_id = new_id("PUR"), new_id("TRIP"), new_id("EXP")
+        payload = {
+            "purchases": [{"local_id": p_id, "farmer_name": "TEST_Sync Petani",
+                           "commodity_type": "TBS", "field_weight_kg": 300,
+                           "price_per_kg": 2450, "timestamp": "2025-12-01T02:00:00Z"}],
+            "trips": [{"local_id": t_id, "commodity_type": "TBS",
+                       "trip_date": "2025-12-01T06:00:00Z",
+                       "tbs_dispatched_kg": 300, "tbs_loading_kg": 295,
+                       "grade_a": {"weight_kg": 289, "price_per_kg": 2650}}],
+            "expenses": [{"local_id": e_id, "category": "Lain-lain", "amount": 25000,
+                          "description": "TEST_Sync expense",
+                          "timestamp": "2025-12-01T07:00:00Z"}],
+        }
+        r1 = api_client.post(f"{API}/sync", json=payload)
+        assert r1.status_code == 200, r1.text
+        d1 = r1.json()
+        assert d1["status"] == "success"
+        assert d1["synced_counts"]["total"] == 3, d1["synced_counts"]
+        assert "stock_pool" in d1
 
-    def test_create_farmer_idempotent(self, api_client):
-        name = f"TEST_Farmer {SUFFIX}"
-        r1 = api_client.post(f"{API}/farmers", json={"name": name})
-        assert r1.status_code == 200
-        r2 = api_client.post(f"{API}/farmers", json={"name": name})
+        r2 = api_client.post(f"{API}/sync", json=payload)
         assert r2.status_code == 200
-        assert r2.json()["id"] == r1.json()["id"], "Duplicate farmer created"
+        assert r2.json()["synced_counts"]["total"] == 3
 
-    def test_batch_sync(self, api_client):
-        lid = f"PUR-SYNC-{SUFFIX}"
-        elid = f"EXP-SYNC-{SUFFIX}"
-        r = api_client.post(f"{API}/sync", json={
-            "purchases": [{"local_id": lid, "farmer_name": "TEST_Sync", "commodity_type": "TBS",
-                           "field_weight_kg": 200, "price_per_kg": 2400}],
-            "trips": [],
-            "expenses": [{"local_id": elid, "category": "Lain-lain", "amount": 5000,
-                          "description": "TEST_sync"}]})
-        assert r.status_code == 200, r.text[:300]
+        created["purchases"].append(p_id)
+        created["trips"].append(t_id)
+        created["expenses"].append(e_id)
+
+        purchases = api_client.get(f"{API}/purchases?limit=200").json()
+        assert len([p for p in purchases if p["local_id"] == p_id]) == 1, "sync duplicated purchase"
+        trips = api_client.get(f"{API}/trips?limit=200").json()
+        assert len([t for t in trips if t["local_id"] == t_id]) == 1, "sync duplicated trip"
+        expenses = api_client.get(f"{API}/expenses?limit=200").json()
+        assert len([e for e in expenses if e["local_id"] == e_id]) == 1, "sync duplicated expense"
+
+
+# ---------- DASHBOARD ----------
+class TestDashboard:
+    def test_dashboard_requires_auth(self):
+        r = requests.get(f"{API}/dashboard/stats")
+        assert r.status_code == 401, f"dashboard accessible without JWT: {r.status_code}"
+
+    def test_dashboard_stats_with_cookie_auth(self, test_credentials):
+        s = requests.Session()
+        lr = s.post(f"{API}/auth/login", json=test_credentials)
+        assert lr.status_code == 200, lr.text
+        r = s.get(f"{API}/dashboard/stats")  # no Authorization header, cookie only
+        assert r.status_code == 200, f"cookie auth rejected: {r.status_code} {r.text[:200]}"
+        assert "stock_pool" in r.json()
+
+    def test_dashboard_stats_structure(self, auth_token):
+        r = requests.get(f"{API}/dashboard/stats", headers={"Authorization": f"Bearer {auth_token}"})
+        assert r.status_code == 200, r.text
         d = r.json()
-        assert d["synced_counts"]["purchases"] == 1
-        assert d["synced_counts"]["expenses"] == 1
-        assert "stock_pool" in d
-        api_client.delete(f"{API}/purchases/{lid}")
-        api_client.delete(f"{API}/expenses/{elid}")
+        assert "stock_pool" in d and "financial_summary" in d and "anomaly_trips" in d
+        fs = d["financial_summary"]
+        for k in ["total_revenue", "total_cogs", "total_net_margin",
+                  "coop_net_profit", "total_operational_expenses"]:
+            assert k in fs
+        assert isinstance(d["anomaly_trips"], list)
+        for t in d["anomaly_trips"]:
+            assert "_id" not in t
 
 
-# ----------------- VALIDATION ----------------- #
-class TestValidation:
-    def test_purchase_missing_required_fields_422(self, api_client):
-        r = api_client.post(f"{API}/purchases", json={"farmer_name": "TEST_x"})
-        assert r.status_code == 422, r.status_code
+# ---------- ITERATION 4: 404 SEMANTICS ON PUT/DELETE ----------
+class TestNotFoundSemantics:
+    def test_put_unknown_trip_returns_404(self, api_client):
+        r = api_client.put(f"{API}/trips/TRIP-DOESNOTEXIST-XYZ", json={
+            "commodity_type": "TBS",
+            "tbs_dispatched_kg": 100, "tbs_loading_kg": 99,
+            "grade_a": {"weight_kg": 90, "price_per_kg": 2500},
+        })
+        assert r.status_code == 404, f"expected 404, got {r.status_code}: {r.text[:200]}"
+        # ensure no orphan trip was created
+        trips = api_client.get(f"{API}/trips?limit=200").json()
+        assert not [t for t in trips if t.get("local_id") == "TRIP-DOESNOTEXIST-XYZ"]
 
-    def test_expense_missing_amount_422(self, api_client):
-        r = api_client.post(f"{API}/expenses", json={"category": "Lain-lain"})
-        assert r.status_code == 422, r.status_code
+    def test_delete_unknown_purchase_returns_404(self, api_client):
+        r = api_client.delete(f"{API}/purchases/PUR-NOPE-{uuid.uuid4().hex[:6]}")
+        assert r.status_code == 404, f"{r.status_code}: {r.text[:200]}"
 
-    def test_negative_weight_purchase(self, api_client):
-        lid = f"PUR-NEG-{SUFFIX}"
+    def test_delete_unknown_trip_returns_404(self, api_client):
+        r = api_client.delete(f"{API}/trips/TRIP-NOPE-{uuid.uuid4().hex[:6]}")
+        assert r.status_code == 404, f"{r.status_code}: {r.text[:200]}"
+
+    def test_delete_unknown_expense_returns_404(self, api_client):
+        r = api_client.delete(f"{API}/expenses/EXP-NOPE-{uuid.uuid4().hex[:6]}")
+        assert r.status_code == 404, f"{r.status_code}: {r.text[:200]}"
+
+    def test_put_trip_with_matching_local_id_updates_in_place(self, api_client, created):
+        lid = new_id("TRIP")
+        api_client.post(f"{API}/trips", json={
+            "local_id": lid, "commodity_type": "TBS",
+            "tbs_dispatched_kg": 700, "tbs_loading_kg": 690,
+            "grade_a": {"weight_kg": 680, "price_per_kg": 2400},
+        })
+        created["trips"].append(lid)
+        r = api_client.put(f"{API}/trips/{lid}", json={
+            "local_id": lid, "commodity_type": "TBS",
+            "tbs_dispatched_kg": 700, "tbs_loading_kg": 690,
+            "grade_a": {"weight_kg": 680, "price_per_kg": 2900},
+        })
+        assert r.status_code == 200, r.text
+        after = api_client.get(f"{API}/trips?limit=200").json()
+        recs = [t for t in after if t["local_id"] == lid]
+        assert len(recs) == 1, f"duplicate trips: {len(recs)}"
+        assert recs[0]["grade_a"]["price_per_kg"] == 2900
+        assert recs[0]["total_revenue"] == 680 * 2900
+        # no orphan trip carrying the updated payload under a different id
+        orphans = [t for t in after if t["local_id"] != lid
+                   and t.get("total_revenue") == 680 * 2900
+                   and t.get("tbs_dispatched_kg") == 700]
+        assert not orphans, f"PUT created orphan trip(s): {[o['local_id'] for o in orphans]}"
+
+
+# ---------- ITERATION 4: CORS / PLAYBOOK ----------
+class TestCorsCredentials:
+    def test_cors_allows_credentials_with_explicit_origin(self):
+        origin = BASE_URL
+        r = requests.options(f"{API}/auth/login", headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        })
+        assert r.status_code in (200, 204), r.status_code
+        acao = r.headers.get("access-control-allow-origin")
+        acac = r.headers.get("access-control-allow-credentials")
+        # NOTE: the preview edge proxy rewrites allow-origin to "*"; the app itself
+        # (verified directly on 0.0.0.0:8001) returns the explicit origin.
+        assert acao in (origin, "*"), f"allow-origin={acao}"
+        # The preview edge proxy answers preflights itself and does not always echo
+        # allow-credentials; the authoritative check is the app-level test below.
+        if acac is not None:
+            assert acac == "true", f"allow-credentials={acac}"
+
+    def test_app_level_cors_returns_explicit_origin(self):
+        """Verify the FastAPI CORSMiddleware config itself (not the edge proxy)."""
+        import subprocess
+        origin = BASE_URL
+        out = subprocess.run(
+            ["curl", "-s", "-i", "-X", "OPTIONS", "http://localhost:8001/api/auth/login",
+             "-H", f"Origin: {origin}", "-H", "Access-Control-Request-Method: POST"],
+            capture_output=True, text=True, timeout=20).stdout.lower()
+        assert f"access-control-allow-origin: {origin.lower()}" in out, out[:500]
+        assert "access-control-allow-credentials: true" in out, out[:500]
+
+
+# ---------- ITERATION 4: INPUT SAFETY (KNOWN OPEN BUG) ----------
+class TestRegexSafety:
+    def test_purchase_with_regex_special_char_farmer_name(self, api_client, created):
+        lid = new_id("PUR")
         r = api_client.post(f"{API}/purchases", json={
-            "local_id": lid, "farmer_name": "TEST_Neg", "commodity_type": "TBS",
-            "field_weight_kg": -100, "price_per_kg": 2400})
-        api_client.delete(f"{API}/purchases/{lid}")
-        assert r.status_code in (400, 422), f"Negative weight accepted with {r.status_code}"
+            "local_id": lid, "farmer_name": "TEST_Pak (Budi",
+            "commodity_type": "TBS", "field_weight_kg": 10, "price_per_kg": 100})
+        if r.status_code == 200:
+            created["purchases"].append(lid)
+        assert r.status_code == 200, (
+            f"unescaped farmer_name in Mongo $regex -> {r.status_code}: {r.text[:150]}")

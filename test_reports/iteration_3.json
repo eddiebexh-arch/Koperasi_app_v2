@@ -1,0 +1,38 @@
+{
+  "summary": "Backend-only regression testing (iteration 3) of BUB Makekal Hulu palm oil app via public URL. Rewrote /app/backend/tests/backend_test.py as pytest with 19 tests covering auth (no lockout, bcrypt, httpOnly cookie), stock-pool, backdated purchases/trips/expenses, DUAL commodity trip revenue+unloading math, editable unloading rates, edit/delete CRUD, WAC recalc after trip delete, batch sync idempotency and dashboard stats. Result: 17/19 passed (89%). Two real defects found: (1) PUT /api/trips/{trip_id} ignores the path id and inserts a brand-new trip when the body omits local_id; (2) GET /api/dashboard/stats is publicly accessible (no JWT required) despite the spec.",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "PUT /api/trips/{trip_id}", "issue": "Handler simply calls create_sales_trip(payload) and never uses the {trip_id} path param. If the body omits local_id a NEW trip is created (verified: orphan TRIP-16CB861889 with revenue 1,248,000 inserted while the target trip kept its old price 2500). Also returns 200 for non-existent trip ids instead of 404. Fix: force payload.local_id = trip_id (or lookup-then-404) before recomputing.", "priority": "HIGH"},
+      {"endpoint": "GET /api/dashboard/stats", "issue": "Returns 200 with full financial data without any JWT/cookie - no Depends(get_current_user) on line ~842. Spec requires 401 when unauthenticated. Full revenue/COGS/margin/receivables data is publicly exposed.", "priority": "HIGH"}
+    ],
+    "minor": [
+      {"endpoint": "DELETE /api/purchases|/trips|/expenses/{id}", "issue": "Always returns 200 'berhasil dihapus' even when deleted_count == 0 (unknown id). Should return 404 so the UI does not show a false success."},
+      {"endpoint": "POST/PUT/DELETE /api/purchases, /api/trips, /api/expenses, POST /api/sync, POST /api/seed-demo", "issue": "All write endpoints are unauthenticated. Anyone can create/edit/delete transactions or wipe all data via POST /api/seed-demo (which delete_many's purchases, trips, expenses). At minimum protect /seed-demo."},
+      {"endpoint": "POST /api/farmers, POST /api/purchases", "issue": "farmer_name is interpolated directly into a MongoDB $regex ({'$regex': f'^{name}$'}). Special regex chars in a farmer name (e.g. 'Pak (Budi)') can raise a regex error / cause ReDoS. Escape with re.escape()."},
+      {"endpoint": "PUT /api/purchases/{id}", "issue": "Uses PurchaseTransactionCreate so all fields are required-ish; partial updates are not supported and omitted optional fields (photo_url, notes) get reset to defaults."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/backend_test.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "PUT /api/trips/{trip_id}: bind payload.local_id to the path trip_id and 404 when the trip does not exist (currently creates duplicate trips).",
+    "Add Depends(get_current_user) to GET /api/dashboard/stats (spec: 401 without JWT).",
+    "Return 404 from DELETE endpoints when deleted_count == 0.",
+    "Protect write endpoints (especially POST /api/seed-demo which deletes all transactional data) with JWT.",
+    "re.escape() farmer_name before using it in a Mongo $regex query."
+  ],
+  "critical_code_review_comments": [
+    "server.py PUT /trips delegates to create_sales_trip without using trip_id -> silent duplicate insert; classic upsert-by-body-id bug.",
+    "server.py is 1041 lines; split into routers/ (auth, purchases, trips, expenses, dashboard) + services/stock_pool.py.",
+    "compute_virtual_stock_pool() loads up to 10k purchases + 5k trips into memory on every stock-pool/trip/sync/dashboard call - move to aggregation pipeline before data grows.",
+    "POST /api/sync swallows per-item exceptions and only logs them; the response counts do not reflect failures, so an offline client will mark failed records as synced. Return a per-item failures array."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "89% (17/19)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Created and then cleaned up TEST_-prefixed purchases/trips/expenses (local_ids PUR-TEST*, TRIP-TEST*, EXP-TEST*). Also removed the orphan trip TRIP-16CB861889 produced by the PUT bug. DB left with only the 2 demo trips + demo purchases/expenses.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "admin@makekal.id / SawitMakekal2026! (from /app/memory/test_credentials.md) - login 200, bcrypt hash starts with $2b$, httpOnly cookie set, 7 consecutive wrong passwords all returned 401 (no 429, no lockout - as user requested), correct password still works after failures.",
+  "context_for_next_testing_agent": "pytest suite at /app/backend/tests/backend_test.py runs against REACT_APP_BACKEND_URL and self-cleans (session fixture 'created'). Verified passing: DUAL trip (commodity_type='DUAL', total_revenue=3,391,000 = 2,430,000 grade_a + 841,000 berondol_sold + 120,000 berondol_grade_b; unloading_cost=56,900 with defaults 40k/60k per ton and 72,600 with custom 50k/80k), backdate on purchases/trips/expenses, PUT purchase recompute (400kg*2500=1,000,000), 404 on PUT unknown purchase, deletes, WAC/grade_b_returned reverting after trip delete, sync idempotency (no duplicates on repeat). Only the 2 tests listed in backend_issues.critical fail - re-run the same file after fixes.",
+  "rca_of_the_issue": "PUT /api/trips/{trip_id} (server.py ~line 712) is `res = await create_sales_trip(payload)`. create_sales_trip derives local_id from payload.local_id or generates a fresh one, so the path parameter is dead code: with local_id in the body it happens to upsert correctly, without it a new trip document is inserted and the intended record is untouched. GET /api/dashboard/stats (~line 842) has no dependency injection for auth, so the JWT requirement stated in the spec is not enforced."
+}

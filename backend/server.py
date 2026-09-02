@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
@@ -153,6 +154,7 @@ class SalesTripCreate(BaseModel):
     
     # Berondol Direct Sale in same trip
     berondol_sold: Optional[GradeSplit] = None
+    berondol_grade_b_sold: Optional[GradeSplit] = None
 
     # Logistics (per ton defaults)
     transport_rate_per_ton: float = 70000.0
@@ -353,7 +355,7 @@ async def get_farmers():
 @api_router.post("/farmers")
 async def create_farmer(payload: FarmerCreate):
     name_clean = payload.name.strip()
-    existing = await db.farmers.find_one({"name": {"$regex": f"^{name_clean}$", "$options": "i"}})
+    existing = await db.farmers.find_one({"name": {"$regex": f"^{re.escape(name_clean)}$", "$options": "i"}})
     if existing:
         return convert_mongo_id(existing)
     
@@ -464,7 +466,7 @@ async def create_purchase(payload: PurchaseTransactionCreate):
     
     farmer_name = payload.farmer_name.strip()
     if farmer_name:
-        existing_farmer = await db.farmers.find_one({"name": {"$regex": f"^{farmer_name}$", "$options": "i"}})
+        existing_farmer = await db.farmers.find_one({"name": {"$regex": f"^{re.escape(farmer_name)}$", "$options": "i"}})
         if not existing_farmer:
             await db.farmers.insert_one({
                 "name": farmer_name,
@@ -545,6 +547,8 @@ async def delete_purchase(purchase_id: str):
             res = await db.purchase_transactions.delete_one({"_id": ObjectId(purchase_id)})
         except Exception:
             pass
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Data pembelian tidak ditemukan.")
     return {"message": "Data pembelian berhasil dihapus"}
 
 
@@ -599,11 +603,14 @@ async def create_sales_trip(payload: SalesTripCreate):
     rev_a = grade_a.weight_kg * grade_a.price_per_kg if grade_a.revenue == 0 else grade_a.revenue
     rev_b = grade_b_sold.weight_kg * grade_b_sold.price_per_kg if grade_b_sold.revenue == 0 else grade_b_sold.revenue
     
-    # Berondol Direct Revenue in same trip
+    # Berondol Direct Revenue in same trip (Grade A default berondol_sold + optional Grade B)
     berondol_sold = payload.berondol_sold or GradeSplit()
     rev_brd = berondol_sold.weight_kg * berondol_sold.price_per_kg if berondol_sold.revenue == 0 else berondol_sold.revenue
-    
-    total_revenue = rev_a + rev_b + rev_brd
+
+    berondol_gb = payload.berondol_grade_b_sold or GradeSplit()
+    rev_brd_gb = berondol_gb.weight_kg * berondol_gb.price_per_kg if berondol_gb.revenue == 0 else berondol_gb.revenue
+
+    total_revenue = rev_a + rev_b + rev_brd + rev_brd_gb
 
     # COGS allocated
     # TBS sold = TBS dispatched minus returned Grade B (which stays in Berondol pool)
@@ -669,6 +676,11 @@ async def create_sales_trip(payload: SalesTripCreate):
             "price_per_kg": round(berondol_sold.price_per_kg, 2),
             "revenue": round(rev_brd, 2)
         },
+        "berondol_grade_b_sold": {
+            "weight_kg": round(berondol_gb.weight_kg, 2),
+            "price_per_kg": round(berondol_gb.price_per_kg, 2),
+            "revenue": round(rev_brd_gb, 2)
+        },
         "cogs_allocated": round(cogs_allocated, 2),
         "wac_tbs_applied": round(wac_tbs, 2),
         "wac_berondol_applied": round(wac_berondol, 2),
@@ -702,7 +714,20 @@ async def create_sales_trip(payload: SalesTripCreate):
 
 @api_router.put("/trips/{trip_id}")
 async def update_sales_trip(trip_id: str, payload: SalesTripCreate):
-    # Re-run trip creation calculations and update
+    # Ensure the update targets the intended trip: bind local_id from path
+    existing = await db.sales_trips.find_one({"local_id": trip_id})
+    if not existing:
+        try:
+            from bson import ObjectId
+            existing = await db.sales_trips.find_one({"_id": ObjectId(trip_id)})
+            if existing:
+                trip_id = existing.get("local_id") or trip_id
+        except Exception:
+            pass
+    if not existing:
+        raise HTTPException(status_code=404, detail="Data trip tidak ditemukan.")
+
+    payload.local_id = trip_id
     res = await create_sales_trip(payload)
     return {"message": "Data trip berhasil diperbarui", "trip": res}
 
@@ -715,6 +740,8 @@ async def delete_sales_trip(trip_id: str):
             res = await db.sales_trips.delete_one({"_id": ObjectId(trip_id)})
         except Exception:
             pass
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Data trip tidak ditemukan.")
     return {"message": "Data trip berhasil dihapus"}
 
 @api_router.patch("/trips/{trip_id}/pay")
@@ -781,6 +808,8 @@ async def delete_expense(expense_id: str):
             res = await db.operational_expenses.delete_one({"_id": ObjectId(expense_id)})
         except Exception:
             pass
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Data pengeluaran tidak ditemukan.")
     return {"message": "Data pengeluaran berhasil dihapus"}
 
 
@@ -830,7 +859,7 @@ async def batch_sync(payload: BatchSyncPayload):
 # ----------------- DASHBOARD METRICS ----------------- #
 
 @api_router.get("/dashboard/stats")
-async def get_dashboard_stats():
+async def get_dashboard_stats(current_user: dict = Depends(get_current_user)):
     pool = await compute_virtual_stock_pool()
     trips = await db.sales_trips.find().sort("trip_date", -1).to_list(1000)
     purchases = await db.purchase_transactions.find().sort("timestamp", -1).to_list(5000)
